@@ -1,0 +1,5 @@
+nim gplv3 public
+https://github.com/ItsNotPaths/wayluigi.git
+https://github.com/ItsNotPaths/rawk-luigi.git
+# editor is hand-rolled in src/editor.nim (not rawk-bufferlib) — we have
+# specialised needs (pin/drag-to-slider, rawklang-only highlighting).

@@ -1,0 +1,45 @@
+[user_input] keyboard=us timezone=America/New_York hostname=unrawk-test user=alice password=<password> luks_passphrase=<luks_passphrase> disk=/dev/sda filesystem=ext4
+[note]       start: Partition disk (GPT: ESP + LUKS container)
+[exec]       parted -s /dev/sda mklabel gpt
+[exec]       parted -s /dev/sda mkpart ESP fat32 1MiB 513MiB
+[exec]       parted -s /dev/sda set 1 esp on
+[exec]       parted -s /dev/sda mkpart cryptroot 513MiB 100%
+[note]       start: LUKS format + open as cryptroot
+[exec]       cryptsetup luksFormat /dev/sda2  (stdin: <luks-passphrase>)
+[exec]       cryptsetup open /dev/sda2 cryptroot  (stdin: <luks-passphrase>)
+[note]       start: mkfs (FAT on ESP, ext4 on cryptroot)
+[exec]       mkfs.fat -F32 /dev/sda1
+[exec]       mkfs.ext4 /dev/mapper/cryptroot
+[note]       start: Mount cryptroot at /mnt + ESP at /mnt/boot/efi
+[exec]       mount /dev/mapper/cryptroot /mnt
+[exec]       mkdir -p /mnt/boot/efi
+[exec]       mount /dev/sda1 /mnt/boot/efi
+[note]       start: xbps-install base-system + unrawk-base
+[exec]       xbps-install -Sy -R https://repo.unrawk.example -r /mnt base-system unrawk-base
+[note]       start: xchroot configure (hostname, fstab, users, grub, locale)
+[write]      /mnt/etc/hostname:
+unrawk-test
+[write]      /mnt/etc/fstab:
+UUID=<esp-uuid>     /boot/efi  vfat  defaults  0 2
+/dev/mapper/cryptroot  /  ext4  defaults  0 1
+[write]      /mnt/etc/crypttab:
+cryptroot  UUID=<luks-uuid>  none  luks
+[exec]       xchroot /mnt useradd -mG wheel alice
+[exec]       xchroot /mnt passwd alice  (stdin: <password>)
+[exec]       xchroot /mnt passwd -l root
+[write]      /mnt/etc/locale.conf:
+LANG=<derived-from-timezone-country>
+[write]      /mnt/etc/vconsole.conf:
+KEYMAP=us
+[exec]       ln -sf /usr/share/zoneinfo/America/New_York /mnt/etc/localtime
+[write]      /mnt/etc/default/grub:
+GRUB_ENABLE_CRYPTODISK=y
+GRUB_CMDLINE_LINUX="rd.luks.uuid=<luks-uuid>"
+[exec]       xchroot /mnt grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=unrawk
+[exec]       xchroot /mnt grub-mkconfig -o /boot/grub/grub.cfg
+[exec]       xchroot /mnt xbps-reconfigure -f linux<v>
+[note]       start: Unmount + sync
+[exec]       umount /mnt/boot/efi
+[exec]       umount /mnt
+[exec]       sync
+[note]       install complete
