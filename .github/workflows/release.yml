@@ -3,11 +3,11 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Release tag (e.g. v1.0.0)'
+        description: 'Release tag (e.g. v0.1.0)'
         required: true
         type: string
       notes:
-        description: 'Release notes'
+        description: 'Release notes / body'
         required: false
         type: string
         default: ''
@@ -19,117 +19,120 @@ on:
 
 env:
   PROJECT_NAME: unrawk-installer
+  SRC_NAME: unrawk_installer       # Nim source/binary name (underscored)
 
 jobs:
   build-linux:
     runs-on: ubuntu-latest
-    # TODO: if you need an older glibc floor, switch to a container like:
-    #   container: ubuntu:20.04
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: '2.0.x'
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve dep HEADs
+        # The download-deps.sh hash alone doesn't change when our
+        # vendored repos move forward, which can bake stale wayluigi /
+        # rawk-luigi into a release. Hash the remote HEADs into the
+        # cache key so any dep update triggers a fresh fetch.
+        id: dep-heads
+        run: |
+          luigi_sha=$(git ls-remote https://github.com/ItsNotPaths/wayluigi.git HEAD | cut -f1)
+          rl_sha=$(git ls-remote https://github.com/ItsNotPaths/rawk-luigi.git HEAD | cut -f1)
+          echo "key=${luigi_sha:0:12}-${rl_sha:0:12}" >> "$GITHUB_OUTPUT"
 
       - name: Cache vendor/
         uses: actions/cache@v4
         with:
           path: vendor
-          key: vendor-linux-${{ hashFiles('download-deps.sh') }}
+          key: vendor-linux-wayland-${{ hashFiles('download-deps.sh') }}-${{ steps.dep-heads.outputs.key }}
 
       - name: Download deps
         run: |
           chmod +x ./download-deps.sh
           ./download-deps.sh
 
-      - name: Install toolchain
-        run: |
-          curl -fsSL https://nim-lang.org/download/nim-2.2.4-linux_x64.tar.xz | tar xJ -C /opt
-          echo /opt/nim-2.2.4/bin >> $GITHUB_PATH
-
-      - name: Build
-        run: |
-          # TODO: tune for your project (extra -d flags, SDL2 includes, etc.)
-          nim c -d:release --opt:speed -o:"$PROJECT_NAME" "src/$PROJECT_NAME.nim"
-          strip --strip-all "$PROJECT_NAME"
-
-      - name: Stage artifacts
-        run: |
-          mkdir -p dist
-          # TODO: copy the files you want in the linux release into dist/
-          [ -f "$PROJECT_NAME" ] && cp "$PROJECT_NAME" dist/ || true
-          [ -d dist-stage ] && cp -r dist-stage/. dist/ || true
-          [ -f README.md ] && cp README.md dist/ || true
-          [ -f LICENSE ] && cp LICENSE dist/ || true
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: linux-zip
-          path: dist
-
-  build-windows:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Cache vendor/
-        uses: actions/cache@v4
-        with:
-          path: vendor
-          key: vendor-windows-${{ hashFiles('download-deps.sh') }}
-
-      - name: Download deps
-        run: |
-          chmod +x ./download-deps.sh
-          ./download-deps.sh
-
-      - name: Install toolchain
+      - name: Install wayland dev headers
         run: |
           sudo apt-get update
-          sudo apt-get install -y mingw-w64
-          curl -fsSL https://nim-lang.org/download/nim-2.2.4-linux_x64.tar.xz | tar xJ -C /opt
-          echo /opt/nim-2.2.4/bin >> $GITHUB_PATH
+          sudo apt-get install -y libwayland-dev libxkbcommon-dev libfreetype-dev fontconfig
 
-      - name: Build
+      - name: Build (wayland)
+        # Size-tuned flag set, mirroring Edrawk's release build:
+        #   -d:danger          — drops bounds/nil/overflow checks. Installer
+        #                        runs once per machine; a one-shot crash is
+        #                        survivable, the binary-size win is large.
+        #   -d:strip / -d:lto  — strip + LTO.
+        #   -d:noSignalHandler — no Nim SIGSEGV/SIGINT handler (~3 KB).
+        #   --threads:off      — we never createThread.
+        #   --panics:on        — exceptions → panics; smaller .text.
+        #   --stackTrace:off /
+        #     --lineTrace:off  — drop file:line strings.
+        #   -fno-pie / -no-pie — saves a few KB; installer isn't a
+        #                        network daemon.
         run: |
-          # TODO: nim cross-compile to Windows needs per-project tuning
-          # (vendor paths, extra --passL flags for SDL2, etc.)
-          nim c -d:release --cpu:amd64 --os:windows \
-              --gcc.exe:x86_64-w64-mingw32-gcc \
-              --gcc.linkerexe:x86_64-w64-mingw32-gcc \
-              -o:"$PROJECT_NAME.exe" "src/$PROJECT_NAME.nim"
+          nim c --opt:size -d:danger -d:strip -d:lto -d:wayland \
+                -d:noSignalHandler \
+                --threads:off --panics:on \
+                --stackTrace:off --lineTrace:off \
+                --passC:-fno-pie --passL:-no-pie \
+                --passC:-ffunction-sections --passC:-fdata-sections \
+                --passC:-fno-asynchronous-unwind-tables \
+                --passC:-fno-unwind-tables \
+                --passC:-fno-stack-protector \
+                --passL:-Wl,--gc-sections \
+                --passL:-Wl,--build-id=none \
+                --passL:-Wl,-z,norelro \
+                --out:"${SRC_NAME}" "src/${SRC_NAME}.nim"
+          strip --strip-all "${SRC_NAME}" || true
+
+      - name: Size guard (<=300 KB)
+        # plans.md targets sub-500 KB for rawk applets. Installer carries
+        # more modules than Drawk/Thrawk (preflight + runmode + install +
+        # logger + widgets + pickers), so budget 300 KB.
+        run: |
+          BYTES=$(stat -c%s "${SRC_NAME}")
+          echo "binary size: ${BYTES}"
+          if [ "$BYTES" -gt 307200 ]; then
+            echo "binary exceeds 300 KB budget (${BYTES} > 307200)" >&2
+            exit 1
+          fi
 
       - name: Stage artifacts
         run: |
           mkdir -p dist
-          # TODO: copy the files you want in the windows release into dist/
-          [ -f "${PROJECT_NAME}.exe" ] && cp "${PROJECT_NAME}.exe" dist/ || true
-          [ -d dist-stage ] && cp -r dist-stage/. dist/ || true
-          [ -f README.md ] && cp README.md dist/ || true
-          [ -f LICENSE ] && cp LICENSE dist/ || true
+          cp "${SRC_NAME}" dist/
+          # Manual-mode crib sheet — overlay's build_iso.sh installs this
+          # at /root/INSTALL.md on the live ISO, alongside the binary.
+          [ -f iso/INSTALL.md ] && cp iso/INSTALL.md dist/ || true
+          [ -f README.md ]      && cp README.md      dist/ || true
+          [ -f LICENSE ]        && cp LICENSE        dist/ || true
 
       - uses: actions/upload-artifact@v4
         with:
-          name: windows-zip
+          name: linux-wayland
           path: dist
 
   release:
-    needs: [build-linux, build-windows]
+    needs: [build-linux]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: linux-zip
-          path: linux-zip
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: windows-zip
-          path: windows-zip
+          name: linux-wayland
+          path: linux-wayland
 
       - name: Package
         run: |
-          (cd linux-zip && zip -r "../${PROJECT_NAME}-linux.zip" .)
-          (cd windows-zip && zip -r "../${PROJECT_NAME}-windows.zip" .)
+          # actions/upload-artifact strips the exec bit; restore +x on
+          # the binary before zipping or consumers get 126 on launch.
+          chmod +x "linux-wayland/${SRC_NAME}"
+          (cd linux-wayland && zip -r "../${PROJECT_NAME}-linux.zip" .)
 
       - name: Create release
         env:
@@ -141,7 +144,7 @@ jobs:
           fi
           gh release create "${{ inputs.version }}" \
               "${PROJECT_NAME}-linux.zip" \
-              "${PROJECT_NAME}-windows.zip" \
+              --repo "${{ github.repository }}" \
               --title "${{ inputs.version }}" \
               --notes "${{ inputs.notes }}" \
               $PRERELEASE_FLAG
