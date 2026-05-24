@@ -1,0 +1,12 @@
+# Btrfs variant of basic.seed. Same fields except filesystem=btrfs, so
+# the diff between basic.txt and btrfs.txt isolates the mkfs + fstab
+# branch.
+
+keyboard        = us
+timezone        = America/New_York
+hostname        = unrawk-btrfs
+user            = alice
+password        = hunter2
+luks_passphrase = openthebox
+disk            = /dev/sda
+filesystem      = btrfs

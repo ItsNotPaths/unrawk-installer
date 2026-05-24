@@ -17,7 +17,7 @@
 ##                                     (gated by /etc/unrawk-live-iso);
 ##                                     refuses otherwise
 
-import std/[os, osproc, strutils]
+import std/[os, options, osproc, strutils]
 import rawk_luigi, theme, preflight, runmode, logger, install
 
 # rawk_luigi doesn't yet expose UILabelSetContent (no consumer needed it
@@ -62,6 +62,7 @@ var
   gInstallState:    InstallState
   gInstallLogBuf:   ref seq[string]
   gInstallLogger:   Logger
+  gInstallRunner:   Runner
   gShownLogCount:   int
   gStepLabels:      array[InstallStep, ptr Label]
   gLogParentPanel:  ptr Panel
@@ -202,9 +203,14 @@ proc refreshExecuteUI() =
     inc gShownLogCount
 
   if gInstallState.finished:
-    if gRebootBtn != nil and (gRebootBtn.e.flags and ELEMENT_HIDE) != 0:
+    # On success: reveal both Reboot and Shell. On failure: Shell only —
+    # disk is half-written, no clean reboot, drop the user into a
+    # terminal to investigate / fix / re-run.
+    if gShellBtn != nil and (gShellBtn.e.flags and ELEMENT_HIDE) != 0:
+      gShellBtn.e.flags = gShellBtn.e.flags and not ELEMENT_HIDE
+    if gInstallState.failedStep.isNone and
+       gRebootBtn != nil and (gRebootBtn.e.flags and ELEMENT_HIDE) != 0:
       gRebootBtn.e.flags = gRebootBtn.e.flags and not ELEMENT_HIDE
-      gShellBtn.e.flags  = gShellBtn.e.flags  and not ELEMENT_HIDE
 
   elementRefresh(addr gScreenPanel.e)
 
@@ -213,6 +219,10 @@ proc initExecute() =
   gInstallLogBuf = new(seq[string])
   gInstallLogBuf[] = @[]
   gInstallLogger = newBufferLogger(gInstallLogBuf, redactSecrets = true)
+  # Interactive Execute always uses the dry-run Runner for now —
+  # for-real interactive UI lands in a later step once the form has
+  # real inputs and the confirm screen owns the disk-arming click.
+  gInstallRunner = newDryRunner(gInstallLogger)
   gShownLogCount = 0
   for step in InstallStep:
     gStepLabels[step] = nil
@@ -300,7 +310,7 @@ proc wipeInvoke(cp: pointer) {.cdecl.} =
 proc executeTickerMessage(e: ptr Element, m: Message, di: cint, dp: pointer): cint {.cdecl.} =
   if m == msgAnimate:
     if not gInstallState.finished:
-      dryRunTick(gInstallState, gInstallLogger)
+      tick(gInstallState, gInstallRunner)
       refreshExecuteUI()
       if gInstallState.finished:
         # Stop the animate loop; the UI is now static until the user
@@ -313,15 +323,19 @@ proc executeTickerMessage(e: ptr Element, m: Message, di: cint, dp: pointer): ci
 
 proc runHeadless(cfg: RunConfig) =
   ## Drain the install flow synchronously to stdout. Pre-flight detect
-  ## is skipped (host-variable; would flake goldens). When step 6 lands
-  ## --for-real wiring, runHeadless with --for-real should be refused
-  ## explicitly — for now it's blocked by the live-ISO marker check.
+  ## is skipped (host-variable; would flake goldens). Mode comes from
+  ## the CLI: dry-run by default, for-real iff --for-real passed AND
+  ## the live-ISO marker exists (already enforced by parseCli +
+  ## enforceForRealMarker before we get here).
   let l = newFileLogger(stdout, redactSecrets = true)
   let form = if cfg.seedPath.len > 0: cfg.seed else: defaultForm
   if cfg.seedPath.len > 0:
     l.logUserInput(seedKvs(cfg.seed))
+  let runner = case cfg.mode
+    of rmDryRun:  newDryRunner(l)
+    of rmForReal: newForRealRunner(l)
   var state = newInstallState(form)
-  state.runHeadless(l)
+  state.drainSync(runner)
 
 proc runInteractive(cfg: RunConfig) =
   initialise()

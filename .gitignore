@@ -2,3 +2,5 @@ vendor/
 unrawk_installer
 installer-overview.md
 installer-spec.md
+.qemu/
+nimcache/
