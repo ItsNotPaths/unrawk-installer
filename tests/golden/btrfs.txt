@@ -1,22 +1,22 @@
 [user_input] keyboard=us timezone=America/New_York hostname=unrawk-btrfs user=alice password=<password> luks_passphrase=<luks_passphrase> disk=/dev/sda filesystem=btrfs
-[note]       start: Partition disk (GPT: ESP + LUKS container)
+[note]       start: Partition disk
 [exec]       parted -s /dev/sda mklabel gpt
 [exec]       parted -s /dev/sda mkpart ESP fat32 1MiB 513MiB
 [exec]       parted -s /dev/sda set 1 esp on
 [exec]       parted -s /dev/sda mkpart cryptroot 513MiB 100%
-[note]       start: LUKS format + open as cryptroot
+[note]       start: LUKS format + open
 [exec]       cryptsetup luksFormat /dev/sda2  (stdin: <luks-passphrase>)
 [exec]       cryptsetup open /dev/sda2 cryptroot  (stdin: <luks-passphrase>)
-[note]       start: mkfs (FAT on ESP, btrfs on cryptroot)
+[note]       start: mkfs (btrfs on cryptroot)
 [exec]       mkfs.fat -F32 /dev/sda1
 [exec]       mkfs.btrfs /dev/mapper/cryptroot
-[note]       start: Mount cryptroot at /mnt + ESP at /mnt/boot/efi
+[note]       start: Mount cryptroot + ESP
 [exec]       mount /dev/mapper/cryptroot /mnt
 [exec]       mkdir -p /mnt/boot/efi
 [exec]       mount /dev/sda1 /mnt/boot/efi
-[note]       start: xbps-install base-system + unrawk-base
+[note]       start: xbps-install base + unrawk
 [exec]       xbps-install -Sy -R https://repo.unrawk.example -r /mnt base-system unrawk-base
-[note]       start: xchroot configure (hostname, fstab, users, grub, locale)
+[note]       start: Configure system in chroot
 [write]      /mnt/etc/hostname:
 unrawk-btrfs
 [write]      /mnt/etc/fstab:

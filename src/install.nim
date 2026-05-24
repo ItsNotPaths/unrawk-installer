@@ -19,12 +19,15 @@ import logger, runmode
 
 type
   InstallStep* = enum
-    isPartition  = "Partition disk (GPT: ESP + LUKS container)"
-    isLuks       = "LUKS format + open as cryptroot"
-    isMkfs       = "mkfs (FAT on ESP, $1 on cryptroot)"
-    isMount      = "Mount cryptroot at /mnt + ESP at /mnt/boot/efi"
-    isXbps       = "xbps-install base-system + unrawk-base"
-    isChroot     = "xchroot configure (hostname, fstab, users, grub, locale)"
+    # Display strings deliberately short — they're prefixed with the
+    # step-state marker ("[*] " etc) in the UI, and the 480px panel
+    # only fits ~50 chars in the default font.
+    isPartition  = "Partition disk"
+    isLuks       = "LUKS format + open"
+    isMkfs       = "mkfs ($1 on cryptroot)"
+    isMount      = "Mount cryptroot + ESP"
+    isXbps       = "xbps-install base + unrawk"
+    isChroot     = "Configure system in chroot"
     isUnmount    = "Unmount + sync"
 
   StepState* = enum

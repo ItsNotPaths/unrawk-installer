@@ -18,7 +18,7 @@
 ##                                     refuses otherwise
 
 import std/[os, options, osproc, strutils]
-import rawk_luigi, theme, preflight, runmode, logger, install
+import rawk_luigi, theme, preflight, runmode, logger, install, widgets, pickers
 
 # rawk_luigi doesn't yet expose UILabelSetContent (no consumer needed it
 # until now). Inline the FFI here; promote to rawk_luigi on next bump.
@@ -44,6 +44,11 @@ const
 
   separator = "=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-="
 
+  # Approx max chars per UI line before luigi clips at the panel right
+  # edge. The separator above is 57 chars and renders flush, so 55 gives
+  # a small safety margin for label rendering quirks. Used by wrapLogLine.
+  uiLineCharLimit = 55
+
 # ---------- screen state ----------
 
 type Screen = enum
@@ -56,6 +61,24 @@ var
   gScreenPanel:   ptr Panel       # rebuilt per screen
   gScreen:        Screen = scForm
   gForm:          FormData
+
+  # Form widget refs — populated by buildForm, read by installInvoke to
+  # gather values into gForm before transitioning to Confirm.
+  gHostnameTb:    ptr Textbox
+  gUserTb:        ptr Textbox
+  gPasswordTb:    ptr MaskedTextbox
+  gLuksTb:        ptr MaskedTextbox
+  gFsExt4Btn:     ptr Button
+  gFsBtrfsBtn:    ptr Button
+  gKbdBtn:        ptr Button
+  gTzBtn:         ptr Button
+  gDiskBtn:       ptr Button
+
+  # Picker session state — populated when a dropdown opens. The menu
+  # item invoke reads gPickerField + the cp-encoded index into
+  # gPickerItems to know what value the user picked.
+  gPickerField:   PickerField
+  gPickerItems:   seq[PickerItem]
 
   # Execute-screen-specific state. Reset by initExecute, read/written by
   # the ticker and the per-tick UI refresh.
@@ -110,6 +133,13 @@ proc rebootInvoke(cp: pointer) {.cdecl.}
 proc installInvoke(cp: pointer) {.cdecl.}
 proc backInvoke(cp: pointer) {.cdecl.}
 proc wipeInvoke(cp: pointer) {.cdecl.}
+proc fsExt4Invoke(cp: pointer) {.cdecl.}
+proc fsBtrfsInvoke(cp: pointer) {.cdecl.}
+proc kbdPickerInvoke(cp: pointer) {.cdecl.}
+proc tzPickerInvoke(cp: pointer) {.cdecl.}
+proc diskPickerInvoke(cp: pointer) {.cdecl.}
+proc pickerItemInvoke(cp: pointer) {.cdecl.}
+proc snapshotForm()
 
 # ---------- screen builders ----------
 
@@ -117,21 +147,80 @@ proc buildHeading(parent: ptr Element, text: string) =
   discard buttonCreate(parent, 0, text.cstring, text.len)
   discard labelCreate(parent, 0, separator.cstring, separator.len)
 
-proc addField(parent: ptr Element, title, value: string) =
+proc addTitle(parent: ptr Element, title: string) =
   discard labelCreate(parent, 0, title.cstring, title.len)
-  discard buttonCreate(parent, 0, value.cstring, value.len)
+
+proc addSeparator(parent: ptr Element) =
   discard labelCreate(parent, 0, separator.cstring, separator.len)
+
+proc addPickerField(parent: ptr Element, title, value: string,
+                    invoke: proc (cp: pointer) {.cdecl.}): ptr Button =
+  ## Picker fields: clickable button showing current value, opens a
+  ## UIMenu popup auto-positioned below the button.
+  addTitle(parent, title)
+  let btn = buttonCreate(parent, 0, value.cstring, value.len)
+  btn.invoke = invoke
+  addSeparator(parent)
+  btn
+
+proc addTextField(parent: ptr Element, title, initial: string,
+                  sideMargin: cint): ptr Textbox =
+  ## `sideMargin` is the width of the spacers on each side of the
+  ## textbox inside its row; the textbox itself gets
+  ## `row.width - 2*sideMargin`. Larger margin = narrower textbox.
+  addTitle(parent, title)
+  let row = panelCreate(parent, PANEL_HORIZONTAL or ELEMENT_H_FILL)
+  discard spacerCreate(addr row.e, sideMargin)
+  let tb = textboxCreate(addr row.e, ELEMENT_H_FILL)
+  tb.setText(initial)
+  discard spacerCreate(addr row.e, sideMargin)
+  addSeparator(parent)
+  tb
+
+proc addMaskedField(parent: ptr Element, title, initial: string,
+                    sideMargin: cint): ptr MaskedTextbox =
+  addTitle(parent, title)
+  let row = panelCreate(parent, PANEL_HORIZONTAL or ELEMENT_H_FILL)
+  discard spacerCreate(addr row.e, sideMargin)
+  let mt = maskedTextboxCreate(addr row.e, ELEMENT_H_FILL)
+  if initial.len > 0:
+    mt.value = initial
+    mt.caret = initial.len
+  discard spacerCreate(addr row.e, sideMargin)
+  addSeparator(parent)
+  mt
+
+proc addFsRadio(parent: ptr Element, active: string) =
+  addTitle(parent, "Filesystem")
+  let row = panelCreate(parent, PANEL_HORIZONTAL or ELEMENT_H_FILL)
+  let ext4Flags  = if active == "ext4":  BUTTON_CHECKED else: 0'u32
+  let btrfsFlags = if active == "btrfs": BUTTON_CHECKED else: 0'u32
+  gFsExt4Btn  = buttonCreate(addr row.e, ext4Flags,  "ext4",  -1)
+  gFsBtrfsBtn = buttonCreate(addr row.e, btrfsFlags, "btrfs", -1)
+  gFsExt4Btn.invoke  = fsExt4Invoke
+  gFsBtrfsBtn.invoke = fsBtrfsInvoke
+  addSeparator(parent)
 
 proc buildForm(parent: ptr Element) =
   buildHeading(parent, "=== unrawk installer ===")
-  addField(parent, "Keyboard",   gForm.keyboard)
-  addField(parent, "Timezone",   gForm.timezone)
-  addField(parent, "Hostname",   gForm.hostname)
-  addField(parent, "User",       gForm.user)
-  addField(parent, "Password",   "********")
-  addField(parent, "Disk",       gForm.disk)
-  addField(parent, "LUKS",       "********")
-  addField(parent, "Filesystem", gForm.filesystem)
+
+  # Pickers — UIMenu auto-positions below the parent button.
+  gKbdBtn = addPickerField(parent, "Keyboard", gForm.keyboard, kbdPickerInvoke)
+  gTzBtn  = addPickerField(parent, "Timezone", gForm.timezone, tzPickerInvoke)
+
+  # Side margins control textbox width. Window is 480 wide:
+  #   hostname/user → ~1/3 of window → margin 160 (textbox ≈ 160)
+  #   password      → ~1/2 of window → margin 120 (textbox ≈ 240)
+  #   luks          → near-full       → margin 20  (textbox ≈ 440)
+  gHostnameTb = addTextField(parent,   "Hostname", gForm.hostname,       160)
+  gUserTb     = addTextField(parent,   "User",     gForm.user,           160)
+  gPasswordTb = addMaskedField(parent, "Password", gForm.password,       120)
+
+  gDiskBtn = addPickerField(parent, "Disk", gForm.disk, diskPickerInvoke)
+
+  gLuksTb     = addMaskedField(parent, "LUKS",     gForm.luksPassphrase, 20)
+
+  addFsRadio(parent, gForm.filesystem)
 
   let install = buttonCreate(parent, 0, "Install", -1)
   install.invoke = installInvoke
@@ -171,8 +260,8 @@ proc buildConfirm(parent: ptr Element) =
   discard labelCreate(parent, 0, "".cstring, 0)
   discard labelCreate(parent, 0, separator.cstring, separator.len)
 
-  discard labelCreate(parent, 0, "WARNING: This will erase all data on the disk above.".cstring, -1)
-  discard labelCreate(parent, 0, "         There is no undo.".cstring, -1)
+  discard labelCreate(parent, 0, "WARNING: this wipes the disk above.".cstring, -1)
+  discard labelCreate(parent, 0, "There is no undo.".cstring, -1)
   discard labelCreate(parent, 0, separator.cstring, separator.len)
 
   let back = buttonCreate(parent, 0, "Back", -1)
@@ -181,6 +270,28 @@ proc buildConfirm(parent: ptr Element) =
   wipe.invoke = wipeInvoke
 
 proc executeTickerMessage(e: ptr Element, m: Message, di: cint, dp: pointer): cint {.cdecl.}
+
+proc wrapLogLine(line: string, width: int): seq[string] =
+  ## Word-boundary wrap so long [exec]/[write] entries (the xbps-install
+  ## one is ~90 chars) become multiple UI rows instead of overflowing.
+  ## Continuation lines get two-space indent so they read as continued.
+  ## The on-disk transcript / headless golden is unaffected; this is
+  ## purely a UI concern.
+  if line.len <= width:
+    return @[line]
+  var cur = ""
+  var first = true
+  for word in line.split(' '):
+    let prefix = if first or cur.len == 0: "" else: " "
+    if cur.len + prefix.len + word.len <= width:
+      cur.add(prefix)
+      cur.add(word)
+    else:
+      if cur.len > 0:
+        result.add(cur)
+        first = false
+      cur = "  " & word
+  if cur.len > 0: result.add(cur)
 
 proc refreshExecuteUI() =
   ## Update step-label content from gInstallState, append any new log
@@ -199,7 +310,8 @@ proc refreshExecuteUI() =
 
   while gShownLogCount < gInstallLogBuf[].len:
     let line = gInstallLogBuf[][gShownLogCount]
-    discard labelCreate(addr gLogParentPanel.e, 0, line.cstring, line.len)
+    for piece in wrapLogLine(line, uiLineCharLimit):
+      discard labelCreate(addr gLogParentPanel.e, 0, piece.cstring, piece.len)
     inc gShownLogCount
 
   if gInstallState.finished:
@@ -271,6 +383,18 @@ proc destroyChildren(parent: ptr Element) =
 proc switchScreen(s: Screen) =
   gScreen = s
   if gScreenPanel != nil:
+    # Children are about to be marked for destroy. Clear globals that
+    # point into the outgoing screen's tree so later code (callbacks,
+    # refresh procs) can't dereference torn-down elements.
+    gHostnameTb = nil
+    gUserTb     = nil
+    gPasswordTb = nil
+    gLuksTb     = nil
+    gFsExt4Btn  = nil
+    gFsBtrfsBtn = nil
+    gKbdBtn     = nil
+    gTzBtn      = nil
+    gDiskBtn    = nil
     destroyChildren(addr gScreenPanel.e)
   case s
   of scForm:    buildForm(addr gScreenPanel.e)
@@ -296,8 +420,82 @@ proc rebootInvoke(cp: pointer) {.cdecl.} =
   ## Dry-run: just exit. Step 6+ will issue `reboot` when --for-real.
   quit(0)
 
+proc snapshotForm() =
+  ## Copy current widget values into gForm. Called before any screen
+  ## transition out of the form, including picker open (so when the
+  ## form rebuilds after a selection, textbox state isn't wiped).
+  if gHostnameTb != nil: gForm.hostname       = readText(gHostnameTb)
+  if gUserTb     != nil: gForm.user           = readText(gUserTb)
+  if gPasswordTb != nil: gForm.password       = gPasswordTb.value
+  if gLuksTb     != nil: gForm.luksPassphrase = gLuksTb.value
+  # Radio + picker values are already in gForm — radio invokes update
+  # immediately, pickers update in pickerItemInvoke before the rebuild.
+
 proc installInvoke(cp: pointer) {.cdecl.} =
+  snapshotForm()
   switchScreen(scConfirm)
+
+# ---------- picker invokes ----------
+
+proc openPicker(parentBtn: ptr Button, field: PickerField,
+                items: seq[PickerItem]) =
+  ## Build a UIMenu below the parent button and show it. luigi
+  ## auto-positions menus under their parent element (see
+  ## luigi.h:10234) — exactly the dropdown affordance we want.
+  if parentBtn == nil or items.len == 0: return
+  gPickerField = field
+  gPickerItems = items
+  let menu = menuCreate(addr parentBtn.e, 0'u32)
+  for i, item in items:
+    menuAddItem(menu, 0,
+      item.display.cstring, item.display.len,
+      pickerItemInvoke, cast[pointer](i))
+  menuShow(menu)
+
+proc kbdPickerInvoke(cp: pointer) {.cdecl.} =
+  openPicker(gKbdBtn, pkfKeyboard, keyboardItems())
+
+proc tzPickerInvoke(cp: pointer) {.cdecl.} =
+  openPicker(gTzBtn, pkfTimezone, timezoneItems())
+
+proc diskPickerInvoke(cp: pointer) {.cdecl.} =
+  openPicker(gDiskBtn, pkfDisk, detectDisks())
+
+proc pickerItemInvoke(cp: pointer) {.cdecl.} =
+  let idx = cast[int](cp)
+  if idx < 0 or idx >= gPickerItems.len: return
+  let value = gPickerItems[idx].value
+  # Snapshot first so any in-progress typing in hostname/user/password
+  # textboxes survives the form rebuild.
+  snapshotForm()
+  case gPickerField
+  of pkfKeyboard: gForm.keyboard = value
+  of pkfTimezone: gForm.timezone = value
+  of pkfDisk:     gForm.disk     = value
+  of pkfNone:     return
+  switchScreen(scForm)
+
+proc setFsChecked(active: string) =
+  ## Toggle BUTTON_CHECKED on the two filesystem radio buttons so the
+  ## visual reflects which is active. Mutating flags + repainting works
+  ## for in-place state changes (no layout shift, no re-create needed).
+  if gFsExt4Btn == nil or gFsBtrfsBtn == nil: return
+  if active == "ext4":
+    gFsExt4Btn.e.flags  = gFsExt4Btn.e.flags  or BUTTON_CHECKED
+    gFsBtrfsBtn.e.flags = gFsBtrfsBtn.e.flags and not BUTTON_CHECKED
+  else:
+    gFsExt4Btn.e.flags  = gFsExt4Btn.e.flags  and not BUTTON_CHECKED
+    gFsBtrfsBtn.e.flags = gFsBtrfsBtn.e.flags or BUTTON_CHECKED
+  elementRepaint(addr gFsExt4Btn.e,  nil)
+  elementRepaint(addr gFsBtrfsBtn.e, nil)
+
+proc fsExt4Invoke(cp: pointer) {.cdecl.} =
+  gForm.filesystem = "ext4"
+  setFsChecked("ext4")
+
+proc fsBtrfsInvoke(cp: pointer) {.cdecl.} =
+  gForm.filesystem = "btrfs"
+  setFsChecked("btrfs")
 
 proc backInvoke(cp: pointer) {.cdecl.} =
   switchScreen(scForm)
