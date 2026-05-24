@@ -62,6 +62,14 @@ var
   gScreen:        Screen = scForm
   gForm:          FormData
 
+  # Run mode for the interactive flow. Set by runInteractive from the
+  # parsed CLI cfg; read by initExecute to pick newDryRunner vs
+  # newForRealRunner, and by rebootInvoke to decide quit-vs-reboot.
+  # --for-real is gated by /etc/unrawk-live-iso upstream (parseCli +
+  # enforceForRealMarker), so by the time we land here it's safe to
+  # honour without an extra arming check beyond the confirm screen.
+  gMode:          RunMode = rmDryRun
+
   # Form widget refs — populated by buildForm, read by installInvoke to
   # gather values into gForm before transitioning to Confirm.
   gHostnameTb:    ptr Textbox
@@ -331,10 +339,13 @@ proc initExecute() =
   gInstallLogBuf = new(seq[string])
   gInstallLogBuf[] = @[]
   gInstallLogger = newBufferLogger(gInstallLogBuf, redactSecrets = true)
-  # Interactive Execute always uses the dry-run Runner for now —
-  # for-real interactive UI lands in a later step once the form has
-  # real inputs and the confirm screen owns the disk-arming click.
-  gInstallRunner = newDryRunner(gInstallLogger)
+  # Pick runner from gMode (set by runInteractive from cfg.mode).
+  # The confirm screen ("Wipe and install" button) is the disk-arming
+  # gate; --for-real is itself gated by enforceForRealMarker before
+  # we ever get here, so the live-ISO marker has been verified.
+  gInstallRunner = case gMode
+    of rmDryRun:  newDryRunner(gInstallLogger)
+    of rmForReal: newForRealRunner(gInstallLogger)
   gShownLogCount = 0
   for step in InstallStep:
     gStepLabels[step] = nil
@@ -417,8 +428,15 @@ proc exitInvoke(cp: pointer) {.cdecl.} =
   quit(1)
 
 proc rebootInvoke(cp: pointer) {.cdecl.} =
-  ## Dry-run: just exit. Step 6+ will issue `reboot` when --for-real.
-  quit(0)
+  ## Dry-run: just exit. For-real: actually reboot the box now that
+  ## the install committed. `reboot` from runit-void issues SIGINT to
+  ## PID 1 which drives a clean stage-3 shutdown.
+  case gMode
+  of rmDryRun:
+    quit(0)
+  of rmForReal:
+    discard execShellCmd("reboot")
+    quit(0)  # fallback if reboot didn't take over
 
 proc snapshotForm() =
   ## Copy current widget values into gForm. Called before any screen
@@ -536,6 +554,11 @@ proc runHeadless(cfg: RunConfig) =
   state.drainSync(runner)
 
 proc runInteractive(cfg: RunConfig) =
+  # Propagate mode to module globals so cdecl callbacks (initExecute,
+  # rebootInvoke) can read it without threading cfg through wayluigi's
+  # message-loop ABI.
+  gMode = cfg.mode
+
   initialise()
   loadInitialTheme()
   loadFont()
