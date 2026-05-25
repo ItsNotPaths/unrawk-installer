@@ -26,10 +26,14 @@ import std/[os, strutils]
 const
   liveIsoMarker* = "/etc/unrawk-live-iso"
 
-  # Placeholder until the unrawk xbps repo exists. preflight's network
-  # gate probes this; install's xbps-install step pulls from it. The
-  # live-ISO build will substitute the real URL at packaging time.
-  repoUrl*       = "https://repo.unrawk.example"
+  # Offline repo bundled into the live ISO by
+  # Unrawk/scripts/bundle-offline-repo.sh (mklive -x postsetup). Contains
+  # every .xbps mklive cached + our local-repo packages, signed by the
+  # dev key already trusted in /var/db/xbps/keys on the live rootfs.
+  # install.nim's xbps-install -R picks up from here without network.
+  # preflight.nim's gateNetwork detects the leading '/' and switches to
+  # a filesystem-existence check instead of curl.
+  repoUrl*       = "/var/lib/unrawk-repo"
   repoProbePath* = "/x86_64-repodata"
 
 type

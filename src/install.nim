@@ -47,7 +47,22 @@ type
 
 const
   stepDurationTicks* = 50            # ~1s per step at wayluigi's animate
-  diskDevice          = "/dev/sda"   # placeholder; real picker is step 7+
+
+proc partDev(disk: string, n: int): string =
+  ## Build a partition device path from a disk path + index. The naming
+  ## convention forks on the base name's final char:
+  ##   /dev/sda   -> /dev/sda1     (SCSI/SATA)
+  ##   /dev/vda   -> /dev/vda1     (virtio block)
+  ##   /dev/nvme0n1 -> /dev/nvme0n1p1   (NVMe — base ends in digit)
+  ##   /dev/mmcblk0 -> /dev/mmcblk0p1   (SD/eMMC — base ends in digit)
+  ##   /dev/loop0   -> /dev/loop0p1     (loop — base ends in digit)
+  ## Rule: separator is 'p' iff the basename's last char is a digit,
+  ## because that's where bare-digit concatenation would be ambiguous
+  ## with the device name itself.
+  if disk.len > 0 and disk[^1] in {'0' .. '9'}:
+    disk & "p" & $n
+  else:
+    disk & $n
 
 # ---------- runner ----------
 
@@ -91,34 +106,72 @@ proc place*(r: Runner, path: string, content: string): bool =
 # ---------- per-step bodies ----------
 
 proc runPartition(s: InstallState, r: Runner): bool =
-  if not r.exec(&"parted -s {diskDevice} mklabel gpt"): return false
-  if not r.exec(&"parted -s {diskDevice} mkpart ESP fat32 1MiB 513MiB"): return false
-  if not r.exec(&"parted -s {diskDevice} set 1 esp on"): return false
-  if not r.exec(&"parted -s {diskDevice} mkpart cryptroot 513MiB 100%"): return false
+  let disk = s.form.disk
+  # Stale-state cleanup. If anything on the target disk is in use (a
+  # leftover mount from a previous boot, an active LUKS mapping, swap,
+  # or just udev caching an old partition node), parted writes the new
+  # GPT to disk but the kernel keeps the OLD layout — the BLKPG ioctl
+  # fails with "unable to inform the kernel of the change". Downstream
+  # mkfs steps then format whatever the old layout pointed at.
+  #
+  # Each cleanup line ends with `; true` so a "nothing to clean" exit
+  # doesn't abort the install. execCmdEx runs via /bin/sh -c (per Nim
+  # docs) so shell features (pipes, redir, ;) work without sh -c wrap.
+  if not r.exec("swapoff -a 2>/dev/null; true"): return false
+  # umount anything mounted from this disk. /proc/mounts field 1 is the
+  # device; index($1, d)==1 catches /dev/<disk>, /dev/<disk>{1,p1}, etc.
+  if not r.exec(&"awk -v d={disk} 'index($1, d)==1 {{print $2}}' /proc/mounts | xargs -r umount -R 2>/dev/null; true"): return false
+  # Close a `cryptroot` mapping if one is left over from a previous
+  # attempt on this disk. (Naming is fixed in runLuks below.)
+  if not r.exec("cryptsetup status cryptroot >/dev/null 2>&1 && cryptsetup close cryptroot; true"): return false
+  # wipefs zeroes existing filesystem signatures so udev/blkid drop
+  # their cached labels — additional persuasion for the kernel to let go.
+  if not r.exec(&"wipefs -a {disk}"): return false
+
+  # Re-create the partition table.
+  if not r.exec(&"parted -s {disk} mklabel gpt"): return false
+  if not r.exec(&"parted -s {disk} mkpart ESP fat32 1MiB 513MiB"): return false
+  if not r.exec(&"parted -s {disk} set 1 esp on"): return false
+  if not r.exec(&"parted -s {disk} mkpart cryptroot 513MiB 100%"): return false
+
+  # Force the kernel to re-read the new table, then wait for udev to
+  # finish creating the partition device nodes before mkfs tries to
+  # open them.
+  if not r.exec(&"partprobe {disk}"): return false
+  if not r.exec("udevadm settle"): return false
   true
 
 proc runLuks(s: InstallState, r: Runner): bool =
   let pw = s.form.luksPassphrase
-  if not r.exec(&"cryptsetup luksFormat {diskDevice}2",
+  let p2 = partDev(s.form.disk, 2)
+  if not r.exec(&"cryptsetup luksFormat {p2}",
                 "luks-passphrase", pw & "\n"): return false
-  if not r.exec(&"cryptsetup open {diskDevice}2 cryptroot",
+  if not r.exec(&"cryptsetup open {p2} cryptroot",
                 "luks-passphrase", pw & "\n"): return false
   true
 
 proc runMkfs(s: InstallState, r: Runner): bool =
-  if not r.exec(&"mkfs.fat -F32 {diskDevice}1"): return false
+  let p1 = partDev(s.form.disk, 1)
+  if not r.exec(&"mkfs.fat -F32 {p1}"): return false
   let mk = if s.form.filesystem == "btrfs": "mkfs.btrfs" else: "mkfs.ext4"
   if not r.exec(&"{mk} /dev/mapper/cryptroot"): return false
   true
 
 proc runMount(s: InstallState, r: Runner): bool =
+  let p1 = partDev(s.form.disk, 1)
   if not r.exec("mount /dev/mapper/cryptroot /mnt"): return false
   if not r.exec("mkdir -p /mnt/boot/efi"): return false
-  if not r.exec(&"mount {diskDevice}1 /mnt/boot/efi"): return false
+  if not r.exec(&"mount {p1} /mnt/boot/efi"): return false
   true
 
 proc runXbps(s: InstallState, r: Runner): bool =
-  if not r.exec(&"xbps-install -Sy -R {repoUrl} -r /mnt base-system unrawk-base"):
+  # -C /tmp/unrawk-xbpsd points xbps at an empty confdir so the install
+  # is hermetic: only the -R repo is consulted, regardless of what the
+  # live env (or, later, anything pre-staged on /mnt) has in xbps.d.
+  # Today /mnt is empty at this step so the isolation is implicit; the
+  # explicit form survives future changes (e.g. rsync-copy install).
+  if not r.exec("mkdir -p /tmp/unrawk-xbpsd"): return false
+  if not r.exec(&"xbps-install -C /tmp/unrawk-xbpsd -Sy -R {repoUrl} -r /mnt base-system unrawk-base"):
     return false
   true
 
@@ -129,7 +182,12 @@ proc runChroot(s: InstallState, r: Runner): bool =
     "/dev/mapper/cryptroot  /  " & s.form.filesystem & "  defaults  0 1"): return false
   if not r.place("/mnt/etc/crypttab",
     "cryptroot  UUID=<luks-uuid>  none  luks"): return false
-  if not r.exec(&"xchroot /mnt useradd -mG wheel {s.form.user}"): return false
+  # audio,video,input cover the standard Wayland desktop affordances —
+  # pipewire/wireplumber audio access, drm/v4l device access, evdev
+  # input for libinput. wheel gates su/doas. Match what mklive's live
+  # adduser.sh hands the live user (modulo input which we add for sway
+  # compositor permissions on seatd-less setups).
+  if not r.exec(&"xchroot /mnt useradd -mG audio,video,input,wheel {s.form.user}"): return false
   if not r.exec(&"xchroot /mnt passwd {s.form.user}",
                 "password", s.form.password & "\n" & s.form.password & "\n"): return false
   if not r.exec("xchroot /mnt passwd -l root"): return false
@@ -149,8 +207,11 @@ proc runChroot(s: InstallState, r: Runner): bool =
   true
 
 proc runUnmount(s: InstallState, r: Runner): bool =
-  if not r.exec("umount /mnt/boot/efi"): return false
-  if not r.exec("umount /mnt"): return false
+  # Recursive umount picks up nested mounts (/mnt/boot/efi, plus any
+  # pseudo-fs xchroot left behind if it didn't clean up). Tolerates "no
+  # mounts left" exits so a clean tear-down doesn't fail the step;
+  # `sync` after is the data-durability safety net before reboot.
+  if not r.exec("umount -R /mnt 2>/dev/null; true"): return false
   if not r.exec("sync"): return false
   true
 

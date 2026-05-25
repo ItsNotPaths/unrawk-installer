@@ -50,19 +50,32 @@ proc gateDisk(): Gate =
     Gate(name: "disk", ok: false, reason: "lsblk failed: " & e.msg)
 
 proc gateNetwork(): Gate =
-  ## HEAD the repodata under the unrawk repo URL. 5s timeout so a dead
-  ## network doesn't hang the gate check.
-  try:
-    let cmd = "curl -fsSI --max-time 5 " & quoteShell(repoUrl & repoProbePath) &
-              " >/dev/null 2>&1"
-    let code = execShellCmd(cmd)
-    if code == 0:
+  ## Verify the install-time repo is reachable. For a local-path repoUrl
+  ## (the live ISO ships an offline bundle at /var/lib/unrawk-repo),
+  ## that's a filesystem-existence check on the repodata file. For an
+  ## http(s) URL, fall back to a 5s-timeout curl HEAD. Same gate name
+  ## either way — the user-visible meaning ("can we install?") is
+  ## constant; only the probe shape changes.
+  if repoUrl.len > 0 and repoUrl[0] == '/':
+    # Local-path repo: $repoUrl/<arch>-repodata is the index file.
+    let indexPath = repoUrl & repoProbePath
+    if fileExists(indexPath):
       Gate(name: "network", ok: true)
     else:
       Gate(name: "network", ok: false,
-           reason: "Cannot reach " & repoUrl)
-  except CatchableError as e:
-    Gate(name: "network", ok: false, reason: "curl failed: " & e.msg)
+           reason: "Local repo index missing: " & indexPath)
+  else:
+    try:
+      let cmd = "curl -fsSI --max-time 5 " & quoteShell(repoUrl & repoProbePath) &
+                " >/dev/null 2>&1"
+      let code = execShellCmd(cmd)
+      if code == 0:
+        Gate(name: "network", ok: true)
+      else:
+        Gate(name: "network", ok: false,
+             reason: "Cannot reach " & repoUrl)
+    except CatchableError as e:
+      Gate(name: "network", ok: false, reason: "curl failed: " & e.msg)
 
 proc detectNvidia(): bool =
   ## Side-detection, not a gate — passed downstream so chroot config can

@@ -35,10 +35,13 @@ const
     keyboard:       "us",
     timezone:       "America/New_York",
     hostname:       "unrawk",
-    user:           "paths",
-    password:       "(unset)",
-    luksPassphrase: "(unset)",
-    disk:           "/dev/sda",
+    # Secrets + identity intentionally blank — the form must reject submits
+    # with empty values (see validateForm). A non-empty default would let
+    # an inattentive user install with sentinel credentials.
+    user:           "",
+    password:       "",
+    luksPassphrase: "",
+    disk:           "/dev/sda",   # picker overrides on first open
     filesystem:     "ext4",
   )
 
@@ -69,6 +72,11 @@ var
   # enforceForRealMarker), so by the time we land here it's safe to
   # honour without an extra arming check beyond the confirm screen.
   gMode:          RunMode = rmDryRun
+
+  # Form-validation feedback. Set by installInvoke when validateForm
+  # rejects a submit; read by buildForm to render an error label above
+  # the picker rows. Cleared on next successful validation.
+  gFormError:     string = ""
 
   # Form widget refs — populated by buildForm, read by installInvoke to
   # gather values into gForm before transitioning to Confirm.
@@ -211,6 +219,14 @@ proc addFsRadio(parent: ptr Element, active: string) =
 
 proc buildForm(parent: ptr Element) =
   buildHeading(parent, "=== unrawk installer ===")
+
+  # Validation feedback from the previous installInvoke, if any.
+  # Rendered above the fields so the user sees what to fix without
+  # losing their typed values (those came in via gForm on rebuild).
+  if gFormError.len > 0:
+    let line = "[!] " & gFormError
+    discard labelCreate(parent, 0, line.cstring, line.len)
+    discard labelCreate(parent, 0, "".cstring, 0)
 
   # Pickers — UIMenu auto-positions below the parent button.
   gKbdBtn = addPickerField(parent, "Keyboard", gForm.keyboard, kbdPickerInvoke)
@@ -449,9 +465,28 @@ proc snapshotForm() =
   # Radio + picker values are already in gForm — radio invokes update
   # immediately, pickers update in pickerItemInvoke before the rebuild.
 
+proc validateForm(f: FormData): seq[string] =
+  ## Reject empty / sentinel values that would silently corrupt a
+  ## for-real install (LUKS with an empty passphrase, useradd with no
+  ## name, hostname literal "(unset)" written to /etc/hostname, etc.).
+  ## Returns one error string per failed field; empty seq means OK.
+  if f.hostname.strip().len == 0:    result.add "hostname is required"
+  if f.user.strip().len == 0:        result.add "user is required"
+  if f.password.len == 0:            result.add "password is required"
+  if f.luksPassphrase.len == 0:      result.add "LUKS passphrase is required"
+  if not f.disk.startsWith("/dev/"): result.add "disk must be a /dev/ path"
+
 proc installInvoke(cp: pointer) {.cdecl.} =
   snapshotForm()
-  switchScreen(scConfirm)
+  let errs = validateForm(gForm)
+  if errs.len > 0:
+    # Stay on the form; rebuild so the error label renders. gForm holds
+    # the user's typed values, so the rebuild repopulates the widgets.
+    gFormError = errs.join("; ")
+    switchScreen(scForm)
+  else:
+    gFormError = ""
+    switchScreen(scConfirm)
 
 # ---------- picker invokes ----------
 
