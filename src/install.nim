@@ -48,6 +48,25 @@ type
 const
   stepDurationTicks* = 50            # ~1s per step at wayluigi's animate
 
+proc lookupUuid(part: string, r: Runner): string =
+  ## Read the filesystem (or LUKS container) UUID for a partition via
+  ## `blkid -s UUID -o value`. In dry-run mode returns a stable
+  ## placeholder so the transcript stays diffable across boots — the
+  ## real partitions don't exist yet anyway. Empty string on failure
+  ## (caller fails the step). Logs the lookup so the transcript shows
+  ## what UUIDs got baked into /etc/fstab etc.
+  if r.mode == rmDryRun:
+    r.logger.logExec("blkid -s UUID -o value " & part & "  (dry-run)")
+    return "DRY-RUN-UUID-" & part
+  r.logger.logExec("blkid -s UUID -o value " & part)
+  let (output, code) = execCmdEx("blkid -s UUID -o value " & part)
+  if code != 0:
+    r.logger.logNote(&"FAIL blkid {part}: exit={code}")
+    return ""
+  let uuid = output.strip()
+  r.logger.logNote("> " & uuid)
+  uuid
+
 proc partDev(disk: string, n: int): string =
   ## Build a partition device path from a disk path + index. The naming
   ## convention forks on the base name's final char:
@@ -128,11 +147,25 @@ proc runPartition(s: InstallState, r: Runner): bool =
   # their cached labels — additional persuasion for the kernel to let go.
   if not r.exec(&"wipefs -a {disk}"): return false
 
-  # Re-create the partition table.
+  # 3-partition LUKS-root layout:
+  #   p1   1..513 MiB   FAT32 ESP            (mounted at /boot/efi)
+  #   p2   513..1537 MiB ext4 /boot          (UNENCRYPTED — GRUB reads
+  #                                           grub.cfg + kernel + initramfs
+  #                                           from here, so no cryptodisk
+  #                                           dance in the EFI binary.)
+  #   p3   1537..end    LUKS-encrypted /     (cryptsetup open → /dev/mapper/cryptroot)
+  #
+  # Threat model: /boot is public (kernel binary, initramfs cpio,
+  # grub.cfg with the LUKS UUID — none of these are secrets). All user
+  # data, /etc/shadow, ssh host keys, dotfiles, etc. live on p3 and stay
+  # encrypted. Evil-maid attacks on /boot need Secure Boot or TPM-sealing
+  # to mitigate; encrypted /boot is not a meaningful defense against that
+  # threat (the EFI binary remains unencrypted regardless).
   if not r.exec(&"parted -s {disk} mklabel gpt"): return false
   if not r.exec(&"parted -s {disk} mkpart ESP fat32 1MiB 513MiB"): return false
   if not r.exec(&"parted -s {disk} set 1 esp on"): return false
-  if not r.exec(&"parted -s {disk} mkpart cryptroot 513MiB 100%"): return false
+  if not r.exec(&"parted -s {disk} mkpart boot ext4 513MiB 1537MiB"): return false
+  if not r.exec(&"parted -s {disk} mkpart cryptroot 1537MiB 100%"): return false
 
   # Force the kernel to re-read the new table, then wait for udev to
   # finish creating the partition device nodes before mkfs tries to
@@ -143,23 +176,35 @@ proc runPartition(s: InstallState, r: Runner): bool =
 
 proc runLuks(s: InstallState, r: Runner): bool =
   let pw = s.form.luksPassphrase
-  let p2 = partDev(s.form.disk, 2)
-  if not r.exec(&"cryptsetup luksFormat {p2}",
+  let p3 = partDev(s.form.disk, 3)
+  if not r.exec(&"cryptsetup luksFormat {p3}",
                 "luks-passphrase", pw & "\n"): return false
-  if not r.exec(&"cryptsetup open {p2} cryptroot",
+  if not r.exec(&"cryptsetup open {p3} cryptroot",
                 "luks-passphrase", pw & "\n"): return false
   true
 
 proc runMkfs(s: InstallState, r: Runner): bool =
   let p1 = partDev(s.form.disk, 1)
+  let p2 = partDev(s.form.disk, 2)
   if not r.exec(&"mkfs.fat -F32 {p1}"): return false
-  let mk = if s.form.filesystem == "btrfs": "mkfs.btrfs" else: "mkfs.ext4"
+  # -F forces mkfs.ext4 over a partition that may still have a stale
+  # signature from a previous install (the disk-level wipefs only nuked
+  # the GPT, not the inside-partition fs signatures).
+  if not r.exec(&"mkfs.ext4 -F {p2}"): return false
+  let mk = if s.form.filesystem == "btrfs": "mkfs.btrfs -f" else: "mkfs.ext4 -F"
   if not r.exec(&"{mk} /dev/mapper/cryptroot"): return false
   true
 
 proc runMount(s: InstallState, r: Runner): bool =
   let p1 = partDev(s.form.disk, 1)
+  let p2 = partDev(s.form.disk, 2)
+  # Order matters: root first, then /boot inside it, then /boot/efi
+  # inside that. xbps-install -r /mnt later writes packages into /mnt and
+  # everything below it; with the mounts already in place, kernel files
+  # land on p2 and the EFI binary lands on p1 automatically.
   if not r.exec("mount /dev/mapper/cryptroot /mnt"): return false
+  if not r.exec("mkdir -p /mnt/boot"): return false
+  if not r.exec(&"mount {p2} /mnt/boot"): return false
   if not r.exec("mkdir -p /mnt/boot/efi"): return false
   if not r.exec(&"mount {p1} /mnt/boot/efi"): return false
   true
@@ -170,18 +215,46 @@ proc runXbps(s: InstallState, r: Runner): bool =
   # live env (or, later, anything pre-staged on /mnt) has in xbps.d.
   # Today /mnt is empty at this step so the isolation is implicit; the
   # explicit form survives future changes (e.g. rsync-copy install).
+  #
+  # Only unrawk-base — NOT base-system. build_iso.sh passes `-b unrawk-base`
+  # to mklive, so the offline bundle has unrawk-base + its transitive
+  # closure, and `base-system` itself is never downloaded. unrawk-base is
+  # the curated replacement (see meta/build-meta.sh "Base subset").
   if not r.exec("mkdir -p /tmp/unrawk-xbpsd"): return false
-  if not r.exec(&"xbps-install -C /tmp/unrawk-xbpsd -Sy -R {repoUrl} -r /mnt base-system unrawk-base"):
+  # `yes |` answers xbps's repo-key trust prompt. xbps-install -y skips
+  # the transaction confirmation but NOT the per-repo XBPS_STATE_REPO_
+  # KEY_IMPORT prompt (xbps/bin/xbps-install/state_cb.c:154-158 calls
+  # yesno() unconditionally). Without a 'y' on stdin, fgetc() returns
+  # EOF and yesno() defaults to false → xbps returns EAGAIN with the
+  # message "failed to import pubkey: resource temporarily unavailable".
+  # `yes` is in coreutils; SIGPIPE retires it when xbps-install exits.
+  if not r.exec(&"yes | xbps-install -C /tmp/unrawk-xbpsd -Sy -R {repoUrl} -r /mnt unrawk-base"):
     return false
   true
 
 proc runChroot(s: InstallState, r: Runner): bool =
+  # Resolve real UUIDs for the ESP / /boot / LUKS partitions. The
+  # initramfs (built by xbps-reconfigure below) and grub need real
+  # values, not the literal "<luks-uuid>"-style placeholders the original
+  # scaffold had.
+  let p1 = partDev(s.form.disk, 1)
+  let p2 = partDev(s.form.disk, 2)
+  let p3 = partDev(s.form.disk, 3)
+  let espUuid  = lookupUuid(p1, r)
+  let bootUuid = lookupUuid(p2, r)
+  let luksUuid = lookupUuid(p3, r)
+  if r.mode == rmForReal and (espUuid.len == 0 or bootUuid.len == 0 or luksUuid.len == 0):
+    r.logger.logNote("FAIL UUID lookup returned empty; refusing to write fstab")
+    return false
+
   if not r.place("/mnt/etc/hostname", s.form.hostname): return false
   if not r.place("/mnt/etc/fstab",
-    "UUID=<esp-uuid>     /boot/efi  vfat  defaults  0 2\n" &
-    "/dev/mapper/cryptroot  /  " & s.form.filesystem & "  defaults  0 1"): return false
+    &"UUID={espUuid}   /boot/efi  vfat  defaults  0 2\n" &
+    &"UUID={bootUuid}  /boot      ext4  defaults  0 2\n" &
+    "/dev/mapper/cryptroot  /  " & s.form.filesystem & "  defaults  0 1\n"): return false
   if not r.place("/mnt/etc/crypttab",
-    "cryptroot  UUID=<luks-uuid>  none  luks"): return false
+    &"cryptroot  UUID={luksUuid}  none  luks\n"): return false
+
   # audio,video,input cover the standard Wayland desktop affordances —
   # pipewire/wireplumber audio access, drm/v4l device access, evdev
   # input for libinput. wheel gates su/doas. Match what mklive's live
@@ -191,19 +264,50 @@ proc runChroot(s: InstallState, r: Runner): bool =
   if not r.exec(&"xchroot /mnt passwd {s.form.user}",
                 "password", s.form.password & "\n" & s.form.password & "\n"): return false
   if not r.exec("xchroot /mnt passwd -l root"): return false
-  if not r.place("/mnt/etc/locale.conf",
-    "LANG=<derived-from-timezone-country>"): return false
-  if not r.place("/mnt/etc/vconsole.conf",
-    "KEYMAP=" & s.form.keyboard): return false
+
+  # Hardcoded en_US.UTF-8 for now — proper timezone→locale derivation is
+  # nontrivial (en_GB vs en_US for English speakers, fr_CA vs fr_FR for
+  # French, etc.) and the form doesn't yet expose a locale picker.
+  if not r.place("/mnt/etc/locale.conf", "LANG=en_US.UTF-8\n"): return false
+  if not r.place("/mnt/etc/vconsole.conf", "KEYMAP=" & s.form.keyboard & "\n"): return false
   if not r.exec(&"ln -sf /usr/share/zoneinfo/{s.form.timezone} /mnt/etc/localtime"):
     return false
+
+  # Force-include dracut's crypt module so the initramfs can unlock
+  # LUKS at boot. Without this, dracut's auto-detection sometimes
+  # leaves the module out (depends on whether dm-crypt is currently
+  # loaded in the live env's kernel when xbps-reconfigure runs inside
+  # the chroot), and the kernel boots without ever prompting for a
+  # passphrase. Symptom: fsck.ext4 errors "No such file or directory"
+  # on /dev/mapper/cryptroot because cryptroot was never opened.
+  if not r.place("/mnt/etc/dracut.conf.d/10-unrawk-crypt.conf",
+    "# unrawk: ensure crypt support is always built into initramfs.\n" &
+    "add_dracutmodules+=\" crypt \"\n"): return false
+
+  # rd.luks.name=<UUID>=<NAME> both activates the LUKS device AND maps
+  # it to /dev/mapper/<NAME>. Using rd.luks.uuid alone would name the
+  # device /dev/mapper/luks-<UUID>, which wouldn't match the
+  # /dev/mapper/cryptroot path in /etc/fstab → fstab can't find root.
+  # NO GRUB_ENABLE_CRYPTODISK: /boot is on the unencrypted p2
+  # partition, so grub.cfg lives in plaintext and GRUB reads it
+  # directly without any cryptomount dance.
   if not r.place("/mnt/etc/default/grub",
-    "GRUB_ENABLE_CRYPTODISK=y\n" &
-    "GRUB_CMDLINE_LINUX=\"rd.luks.uuid=<luks-uuid>\""): return false
-  if not r.exec("xchroot /mnt grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=unrawk"):
+    &"GRUB_CMDLINE_LINUX=\"rd.luks.name={luksUuid}=cryptroot\"\n"): return false
+  # No --modules needed: with /boot unencrypted, GRUB reads kernel +
+  # initramfs + grub.cfg from a plain ext4 partition that the firmware
+  # has handed it via UEFI block I/O services. The LUKS unlock happens
+  # entirely in the initramfs after GRUB has already done its job.
+  if not r.exec("xchroot /mnt grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=unrawk --recheck"):
     return false
   if not r.exec("xchroot /mnt grub-mkconfig -o /boot/grub/grub.cfg"): return false
-  if not r.exec("xchroot /mnt xbps-reconfigure -f linux<v>"): return false
+
+  # -a reconfigures every installed package. This is the right hammer
+  # here because (a) we just wrote /etc/fstab + /etc/crypttab + grub
+  # cmdline that the kernel package's post-install hook needs to see in
+  # order to bake the right initramfs, and (b) the actual kernel pkg
+  # name is version-suffixed on Void (linux6.12 etc.) so we can't pin
+  # `-f <pkgname>` without runtime detection.
+  if not r.exec("xchroot /mnt xbps-reconfigure -a"): return false
   true
 
 proc runUnmount(s: InstallState, r: Runner): bool =

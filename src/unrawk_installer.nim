@@ -354,7 +354,22 @@ proc initExecute() =
   gInstallState = newInstallState(gForm)
   gInstallLogBuf = new(seq[string])
   gInstallLogBuf[] = @[]
-  gInstallLogger = newBufferLogger(gInstallLogBuf, redactSecrets = true)
+  let bufLogger = newBufferLogger(gInstallLogBuf, redactSecrets = true)
+  # In for-real mode tee every line to /var/log/unrawk-install.log so a
+  # failure that scrolls off the UI panel is still recoverable from the
+  # Shell button (or a Ctrl+Alt+F2 tty). Falls back to buffer-only if the
+  # file can't open. Dry-run skips the file: the buffer is canonical and
+  # writing to /var/log of the live ISO would clutter goldens.
+  gInstallLogger =
+    case gMode
+    of rmDryRun:
+      bufLogger
+    of rmForReal:
+      try:
+        let f = open("/var/log/unrawk-install.log", fmAppend)
+        newTeeLogger(bufLogger, newFileLogger(f, redactSecrets = true))
+      except IOError:
+        bufLogger
   # Pick runner from gMode (set by runInteractive from cfg.mode).
   # The confirm screen ("Wipe and install" button) is the disk-arming
   # gate; --for-real is itself gated by enforceForRealMarker before
@@ -465,13 +480,40 @@ proc snapshotForm() =
   # Radio + picker values are already in gForm — radio invokes update
   # immediately, pickers update in pickerItemInvoke before the rebuild.
 
+proc isPosixUser(name: string): bool =
+  ## POSIX username: [a-z_][a-z0-9_-]*  with len 1..32. Void's useradd
+  ## (shadow) rejects uppercase / non-conforming names with exit 3 and
+  ## "invalid user name '<name>'".
+  if name.len == 0 or name.len > 32: return false
+  let c0 = name[0]
+  if not (c0 in {'a'..'z'} or c0 == '_'): return false
+  for c in name[1 .. ^1]:
+    if not (c in {'a'..'z', '0'..'9', '_', '-'}): return false
+  return true
+
+proc isValidHostname(name: string): bool =
+  ## RFC 1123 hostname: letters (either case) + digits + hyphens, no
+  ## leading/trailing hyphen, len 1..63. Looser than POSIX user — case
+  ## is OK because DNS is case-insensitive.
+  if name.len == 0 or name.len > 63: return false
+  if name[0] == '-' or name[^1] == '-': return false
+  for c in name:
+    if not (c in {'a'..'z', 'A'..'Z', '0'..'9', '-'}): return false
+  return true
+
 proc validateForm(f: FormData): seq[string] =
   ## Reject empty / sentinel values that would silently corrupt a
   ## for-real install (LUKS with an empty passphrase, useradd with no
   ## name, hostname literal "(unset)" written to /etc/hostname, etc.).
   ## Returns one error string per failed field; empty seq means OK.
-  if f.hostname.strip().len == 0:    result.add "hostname is required"
-  if f.user.strip().len == 0:        result.add "user is required"
+  if f.hostname.strip().len == 0:
+    result.add "hostname is required"
+  elif not isValidHostname(f.hostname.strip()):
+    result.add "hostname: letters/digits/hyphens only, 1-63 chars, no leading/trailing -"
+  if f.user.strip().len == 0:
+    result.add "user is required"
+  elif not isPosixUser(f.user.strip()):
+    result.add "user: lowercase a-z, 0-9, _ or -; must start with a-z or _; 1-32 chars"
   if f.password.len == 0:            result.add "password is required"
   if f.luksPassphrase.len == 0:      result.add "LUKS passphrase is required"
   if not f.disk.startsWith("/dev/"): result.add "disk must be a /dev/ path"

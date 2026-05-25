@@ -42,6 +42,20 @@ proc newBufferLogger*(buf: ref seq[string], redactSecrets = true): Logger =
     redactSecrets: redactSecrets,
   )
 
+proc newTeeLogger*(a, b: Logger): Logger =
+  ## Fans every emit out to both `a` and `b`. Used by the interactive
+  ## for-real flow to mirror the in-memory log buffer (read by the UI)
+  ## to /var/log/unrawk-install.log (read by humans after a failure,
+  ## since the UI's log panel has no scrollback widget yet).
+  let aa = a
+  let bb = b
+  Logger(
+    emit: proc(line: string) =
+      aa.emit(line)
+      bb.emit(line),
+    redactSecrets: a.redactSecrets,
+  )
+
 proc tagPrefix(tag: string): string =
   result = "[" & tag & "]"
   while result.len < tagWidth + 1:
