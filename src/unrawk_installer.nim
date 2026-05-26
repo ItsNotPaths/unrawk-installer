@@ -35,10 +35,10 @@ const
     keyboard:       "us",
     timezone:       "America/New_York",
     hostname:       "unrawk",
-    # Secrets + identity intentionally blank — the form must reject submits
-    # with empty values (see validateForm). A non-empty default would let
-    # an inattentive user install with sentinel credentials.
-    user:           "",
+    # Secrets intentionally blank — the form must reject submits with
+    # empty values (see validateForm). A non-empty default would let
+    # an inattentive user install with sentinel credentials. `password`
+    # here is root's password (pure-root posture; see install.nim).
     password:       "",
     luksPassphrase: "",
     disk:           "/dev/sda",   # picker overrides on first open
@@ -81,7 +81,6 @@ var
   # Form widget refs — populated by buildForm, read by installInvoke to
   # gather values into gForm before transitioning to Confirm.
   gHostnameTb:    ptr Textbox
-  gUserTb:        ptr Textbox
   gPasswordTb:    ptr MaskedTextbox
   gLuksTb:        ptr MaskedTextbox
   gFsExt4Btn:     ptr Button
@@ -324,12 +323,11 @@ proc buildForm(parent: ptr Element) =
   gTzBtn  = addPickerField(parent, "Timezone", gForm.timezone, tzPickerInvoke)
 
   # Side margins control textbox width. Window is 480 wide:
-  #   hostname/user → ~1/3 of window → margin 160 (textbox ≈ 160)
+  #   hostname      → ~1/3 of window → margin 160 (textbox ≈ 160)
   #   password      → ~1/2 of window → margin 120 (textbox ≈ 240)
   #   luks          → near-full       → margin 20  (textbox ≈ 440)
-  gHostnameTb = addTextField(parent,   "Hostname", gForm.hostname,       160)
-  gUserTb     = addTextField(parent,   "User",     gForm.user,           160)
-  gPasswordTb = addMaskedField(parent, "Password", gForm.password,       120)
+  gHostnameTb = addTextField(parent,   "Hostname",        gForm.hostname, 160)
+  gPasswordTb = addMaskedField(parent, "Root password",   gForm.password, 120)
 
   gDiskBtn = addPickerField(parent, "Disk", gForm.disk, diskPickerInvoke)
 
@@ -365,7 +363,7 @@ proc buildConfirm(parent: ptr Element) =
   discard labelCreate(parent, 0, "Settings:".cstring, -1)
   let lines = [
     "  hostname    " & gForm.hostname,
-    "  user        " & gForm.user,
+    "  user        root (single-user, autologin tty1)",
     "  keyboard    " & gForm.keyboard,
     "  timezone    " & gForm.timezone,
     "  filesystem  " & gForm.filesystem,
@@ -520,7 +518,6 @@ proc switchScreen(s: Screen) =
     # point into the outgoing screen's tree so later code (callbacks,
     # refresh procs) can't dereference torn-down elements.
     gHostnameTb = nil
-    gUserTb     = nil
     gPasswordTb = nil
     gLuksTb     = nil
     gFsExt4Btn  = nil
@@ -568,22 +565,10 @@ proc snapshotForm() =
   ## transition out of the form, including picker open (so when the
   ## form rebuilds after a selection, textbox state isn't wiped).
   if gHostnameTb != nil: gForm.hostname       = readText(gHostnameTb)
-  if gUserTb     != nil: gForm.user           = readText(gUserTb)
   if gPasswordTb != nil: gForm.password       = gPasswordTb.value
   if gLuksTb     != nil: gForm.luksPassphrase = gLuksTb.value
   # Radio + picker values are already in gForm — radio invokes update
   # immediately, pickers update in pickerItemInvoke before the rebuild.
-
-proc isPosixUser(name: string): bool =
-  ## POSIX username: [a-z_][a-z0-9_-]*  with len 1..32. Void's useradd
-  ## (shadow) rejects uppercase / non-conforming names with exit 3 and
-  ## "invalid user name '<name>'".
-  if name.len == 0 or name.len > 32: return false
-  let c0 = name[0]
-  if not (c0 in {'a'..'z'} or c0 == '_'): return false
-  for c in name[1 .. ^1]:
-    if not (c in {'a'..'z', '0'..'9', '_', '-'}): return false
-  return true
 
 proc isValidHostname(name: string): bool =
   ## RFC 1123 hostname: letters (either case) + digits + hyphens, no
@@ -604,11 +589,7 @@ proc validateForm(f: FormData): seq[string] =
     result.add "hostname is required"
   elif not isValidHostname(f.hostname.strip()):
     result.add "hostname: letters/digits/hyphens only, 1-63 chars, no leading/trailing -"
-  if f.user.strip().len == 0:
-    result.add "user is required"
-  elif not isPosixUser(f.user.strip()):
-    result.add "user: lowercase a-z, 0-9, _ or -; must start with a-z or _; 1-32 chars"
-  if f.password.len == 0:            result.add "password is required"
+  if f.password.len == 0:            result.add "root password is required"
   if f.luksPassphrase.len == 0:      result.add "LUKS passphrase is required"
   if not f.disk.startsWith("/dev/"): result.add "disk must be a /dev/ path"
 

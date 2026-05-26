@@ -10,7 +10,6 @@
 keyboard        = us
 timezone        = America/New_York
 hostname        = unrawk-test
-user            = alice
 password        = hunter2
 luks_passphrase = openthebox
 disk            = /dev/sda

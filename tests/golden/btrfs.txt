@@ -1,45 +1,70 @@
-[user_input] keyboard=us timezone=America/New_York hostname=unrawk-btrfs user=alice password=<password> luks_passphrase=<luks_passphrase> disk=/dev/sda filesystem=btrfs seeded_profile=
+[user_input] keyboard=us timezone=America/New_York hostname=unrawk-btrfs password=<password> luks_passphrase=<luks_passphrase> disk=/dev/sda filesystem=btrfs seeded_profile=
 [note]       start: Partition disk
+[exec]       swapoff -a 2>/dev/null; true
+[exec]       awk -v d=/dev/sda 'index($1, d)==1 {print $2}' /proc/mounts | xargs -r umount -R 2>/dev/null; true
+[exec]       cryptsetup status cryptroot >/dev/null 2>&1 && cryptsetup close cryptroot; true
+[exec]       wipefs -a /dev/sda
 [exec]       parted -s /dev/sda mklabel gpt
 [exec]       parted -s /dev/sda mkpart ESP fat32 1MiB 513MiB
 [exec]       parted -s /dev/sda set 1 esp on
-[exec]       parted -s /dev/sda mkpart cryptroot 513MiB 100%
+[exec]       parted -s /dev/sda mkpart boot ext4 513MiB 1537MiB
+[exec]       parted -s /dev/sda mkpart cryptroot 1537MiB 100%
+[exec]       partprobe /dev/sda
+[exec]       udevadm settle
 [note]       start: LUKS format + open
-[exec]       cryptsetup luksFormat /dev/sda2  (stdin: <luks-passphrase>)
-[exec]       cryptsetup open /dev/sda2 cryptroot  (stdin: <luks-passphrase>)
+[exec]       cryptsetup luksFormat /dev/sda3  (stdin: <luks-passphrase>)
+[exec]       cryptsetup open /dev/sda3 cryptroot  (stdin: <luks-passphrase>)
 [note]       start: mkfs (btrfs on cryptroot)
 [exec]       mkfs.fat -F32 /dev/sda1
-[exec]       mkfs.btrfs /dev/mapper/cryptroot
+[exec]       mkfs.ext4 -F /dev/sda2
+[exec]       mkfs.btrfs -f /dev/mapper/cryptroot
 [note]       start: Mount cryptroot + ESP
 [exec]       mount /dev/mapper/cryptroot /mnt
+[exec]       mkdir -p /mnt/boot
+[exec]       mount /dev/sda2 /mnt/boot
 [exec]       mkdir -p /mnt/boot/efi
 [exec]       mount /dev/sda1 /mnt/boot/efi
 [note]       start: xbps-install base + unrawk
-[exec]       xbps-install -Sy -R https://repo.unrawk.example -r /mnt base-system unrawk-base
+[exec]       mkdir -p /tmp/unrawk-xbpsd
+[exec]       yes | xbps-install -C /tmp/unrawk-xbpsd -Sy -R /var/lib/unrawk-repo -r /mnt unrawk-base
 [note]       start: Configure system in chroot
+[exec]       blkid -s UUID -o value /dev/sda1  (dry-run)
+[exec]       blkid -s UUID -o value /dev/sda2  (dry-run)
+[exec]       blkid -s UUID -o value /dev/sda3  (dry-run)
 [write]      /mnt/etc/hostname:
 unrawk-btrfs
 [write]      /mnt/etc/fstab:
-UUID=<esp-uuid>     /boot/efi  vfat  defaults  0 2
 /dev/mapper/cryptroot  /  btrfs  defaults  0 1
+UUID=DRY-RUN-UUID-/dev/sda2  /boot      ext4  defaults  0 2
+UUID=DRY-RUN-UUID-/dev/sda1   /boot/efi  vfat  defaults  0 2
+
 [write]      /mnt/etc/crypttab:
-cryptroot  UUID=<luks-uuid>  none  luks
-[exec]       xchroot /mnt useradd -mG wheel alice
-[exec]       xchroot /mnt passwd alice  (stdin: <password>)
-[exec]       xchroot /mnt passwd -l root
+cryptroot  UUID=DRY-RUN-UUID-/dev/sda3  none  luks
+
+[exec]       mkdir -p /mnt/root/.config/sway
+[exec]       cp -a /mnt/etc/sway/config /mnt/root/.config/sway/config
+[exec]       xchroot /mnt passwd root  (stdin: <password>)
 [write]      /mnt/etc/locale.conf:
-LANG=<derived-from-timezone-country>
+LANG=en_US.UTF-8
+
 [write]      /mnt/etc/vconsole.conf:
 KEYMAP=us
+
 [exec]       ln -sf /usr/share/zoneinfo/America/New_York /mnt/etc/localtime
+[write]      /mnt/etc/dracut.conf.d/10-unrawk-crypt.conf:
+hostonly="no"
+force_add_dracutmodules+=" crypt "
+install_items+=" /usr/sbin/cryptsetup "
+
 [write]      /mnt/etc/default/grub:
-GRUB_ENABLE_CRYPTODISK=y
-GRUB_CMDLINE_LINUX="rd.luks.uuid=<luks-uuid>"
-[exec]       xchroot /mnt grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=unrawk
+GRUB_CMDLINE_LINUX="rd.luks.uuid=DRY-RUN-UUID-/dev/sda3 rd.luks.name=DRY-RUN-UUID-/dev/sda3=cryptroot quiet loglevel=3"
+
+[exec]       xchroot /mnt grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=unrawk --recheck
 [exec]       xchroot /mnt grub-mkconfig -o /boot/grub/grub.cfg
-[exec]       xchroot /mnt xbps-reconfigure -f linux<v>
+[exec]       xchroot /mnt xbps-reconfigure -a
+[exec]       xchroot /mnt sh -c 'kver=$(ls -1 /lib/modules | sort -V | tail -n1) && dracut --no-hostonly --force-add crypt --force "/boot/initramfs-${kver}.img" "${kver}"'
+[exec]       rm -f /mnt/etc/resolv.conf
 [note]       start: Unmount + sync
-[exec]       umount /mnt/boot/efi
-[exec]       umount /mnt
+[exec]       umount -R /mnt 2>/dev/null; true
 [exec]       sync
 [note]       install complete

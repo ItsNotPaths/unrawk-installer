@@ -262,15 +262,32 @@ proc runChroot(s: InstallState, r: Runner): bool =
   if not r.place("/mnt/etc/crypttab",
     &"cryptroot  UUID={luksUuid}  none  luks\n"): return false
 
-  # audio,video,input cover the standard Wayland desktop affordances —
-  # pipewire/wireplumber audio access, drm/v4l device access, evdev
-  # input for libinput. wheel gates su/doas. Match what mklive's live
-  # adduser.sh hands the live user (modulo input which we add for sway
-  # compositor permissions on seatd-less setups).
-  if not r.exec(&"xchroot /mnt useradd -mG audio,video,input,wheel {s.form.user}"): return false
-  if not r.exec(&"xchroot /mnt passwd {s.form.user}",
+  # Seed /root/.config/sway/config so Thrawk has a user-local sway
+  # config to splice the THRAWK:BEGIN/END palette block into.
+  # Intentionally done here (target rootfs at /mnt) instead of in
+  # unrawk-defaults' INSTALL hook — the hook fires inside the live
+  # ISO's mklive build too, and a /root/.config/sway/config there
+  # would beat iso/hooks's /etc/sway/config in sway's lookup order
+  # and kill the installer-autostart line on the live env.
+  #
+  # cp -a preserves mode; the source we ship at /mnt/etc/sway/config
+  # is the same content Thrawk expects (markers in place).
+  if not r.exec("mkdir -p /mnt/root/.config/sway"): return false
+  if not r.exec("cp -a /mnt/etc/sway/config /mnt/root/.config/sway/config"): return false
+
+  # Pure-root single-user posture: no useradd, no wheel, no -l on root.
+  # The session that boots from here logs in as root (via agetty
+  # --autologin root, configured by unrawk-defaults' INSTALL hook on
+  # tty1) and runs the whole desktop as uid 0. The form's password
+  # field is now root's password directly. swaylock + any other
+  # PAM-authenticated tool validates against this hash via the
+  # standard system-auth stack.
+  #
+  # `passwd root` takes the new password twice on stdin (once for set,
+  # once for confirm) — same pattern as the previous useradd-flow's
+  # passwd call.
+  if not r.exec("xchroot /mnt passwd root",
                 "password", s.form.password & "\n" & s.form.password & "\n"): return false
-  if not r.exec("xchroot /mnt passwd -l root"): return false
 
   # Hardcoded en_US.UTF-8 for now — proper timezone→locale derivation is
   # nontrivial (en_GB vs en_US for English speakers, fr_CA vs fr_FR for
@@ -341,8 +358,14 @@ proc runChroot(s: InstallState, r: Runner): bool =
   # NO GRUB_ENABLE_CRYPTODISK: /boot is on the unencrypted p2
   # partition, so grub.cfg lives in plaintext and GRUB reads it
   # directly without any cryptomount dance.
+  # `quiet loglevel=3` silences kernel printk on console below KERN_ERR
+  # during the boot window before /etc/sysctl.d/20-unrawk-quiet.conf
+  # (shipped by unrawk-defaults) drops console_loglevel runtime-side.
+  # Without this, iwlwifi firmware-load lines + wlp*/bluetooth probe
+  # chatter flood the agetty tty between switchroot and runit's sysctl
+  # core-service step. dmesg still captures everything.
   if not r.place("/mnt/etc/default/grub",
-    &"GRUB_CMDLINE_LINUX=\"rd.luks.uuid={luksUuid} rd.luks.name={luksUuid}=cryptroot\"\n"): return false
+    &"GRUB_CMDLINE_LINUX=\"rd.luks.uuid={luksUuid} rd.luks.name={luksUuid}=cryptroot quiet loglevel=3\"\n"): return false
   # No --modules needed: with /boot unencrypted, GRUB reads kernel +
   # initramfs + grub.cfg from a plain ext4 partition that the firmware
   # has handed it via UEFI block I/O services. The LUKS unlock happens
@@ -387,6 +410,22 @@ proc runChroot(s: InstallState, r: Runner): bool =
       "dracut --no-hostonly --force-add crypt --force " &
       "\"/boot/initramfs-${kver}.img\" \"${kver}\"'"):
     return false
+
+  # Remove base-files' stock /etc/resolv.conf from the target.
+  # openresolv (DEPS_BASE; iwd uses it via NameResolvingService=
+  # resolvconf in /etc/iwd/main.conf) refuses to write to a file
+  # that lacks its signature header. base-files ships a placeholder
+  # /etc/resolv.conf without that header, so on first boot iwd
+  # connects but resolvconf bails silently with "signature mismatch"
+  # and /etc/resolv.conf stays empty — qutebrowser symptom is
+  # "site can't be reached" despite an active iwd connection.
+  #
+  # Removing it here lets openresolv create the file fresh (with its
+  # signature) the first time iwd connects on the installed system.
+  # We do this OUTSIDE xchroot so the rm hits the real file in /mnt,
+  # not the live ISO's empty placeholder that xchroot bind-mounts
+  # over /mnt/etc/resolv.conf during xchroot invocations.
+  if not r.exec("rm -f /mnt/etc/resolv.conf"): return false
   true
 
 proc runUnmount(s: InstallState, r: Runner): bool =

@@ -1,4 +1,4 @@
-[user_input] keyboard=us timezone=America/New_York hostname=unrawk-test user=alice password=<password> luks_passphrase=<luks_passphrase> disk=/dev/sda filesystem=ext4 seeded_profile=/var/lib/iwd/MyHomeAP.psk
+[user_input] keyboard=us timezone=America/New_York hostname=unrawk-test password=<password> luks_passphrase=<luks_passphrase> disk=/dev/sda filesystem=ext4 seeded_profile=/var/lib/iwd/MyHomeAP.psk
 [note]       start: Partition disk
 [exec]       swapoff -a 2>/dev/null; true
 [exec]       awk -v d=/dev/sda 'index($1, d)==1 {print $2}' /proc/mounts | xargs -r umount -R 2>/dev/null; true
@@ -41,9 +41,9 @@ UUID=DRY-RUN-UUID-/dev/sda1   /boot/efi  vfat  defaults  0 2
 [write]      /mnt/etc/crypttab:
 cryptroot  UUID=DRY-RUN-UUID-/dev/sda3  none  luks
 
-[exec]       xchroot /mnt useradd -mG audio,video,input,wheel alice
-[exec]       xchroot /mnt passwd alice  (stdin: <password>)
-[exec]       xchroot /mnt passwd -l root
+[exec]       mkdir -p /mnt/root/.config/sway
+[exec]       cp -a /mnt/etc/sway/config /mnt/root/.config/sway/config
+[exec]       xchroot /mnt passwd root  (stdin: <password>)
 [write]      /mnt/etc/locale.conf:
 LANG=en_US.UTF-8
 
@@ -60,12 +60,13 @@ install_items+=" /usr/sbin/cryptsetup "
 omit_dracutmodules+=" btrfs "
 
 [write]      /mnt/etc/default/grub:
-GRUB_CMDLINE_LINUX="rd.luks.uuid=DRY-RUN-UUID-/dev/sda3 rd.luks.name=DRY-RUN-UUID-/dev/sda3=cryptroot"
+GRUB_CMDLINE_LINUX="rd.luks.uuid=DRY-RUN-UUID-/dev/sda3 rd.luks.name=DRY-RUN-UUID-/dev/sda3=cryptroot quiet loglevel=3"
 
 [exec]       xchroot /mnt grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=unrawk --recheck
 [exec]       xchroot /mnt grub-mkconfig -o /boot/grub/grub.cfg
 [exec]       xchroot /mnt xbps-reconfigure -a
 [exec]       xchroot /mnt sh -c 'kver=$(ls -1 /lib/modules | sort -V | tail -n1) && dracut --no-hostonly --force-add crypt --force "/boot/initramfs-${kver}.img" "${kver}"'
+[exec]       rm -f /mnt/etc/resolv.conf
 [note]       start: Unmount + sync
 [exec]       umount -R /mnt 2>/dev/null; true
 [exec]       sync

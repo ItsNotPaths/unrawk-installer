@@ -45,7 +45,11 @@ type
     keyboard*:       string
     timezone*:       string
     hostname*:       string
-    user*:           string
+    # `password` is now ROOT's password — see install.nim runChroot.
+    # The previous model created a wheel-group user + locked root;
+    # unrawk's design intent is pure-root single-user, no doas/sudo,
+    # so the user-creation step was removed and this field sets
+    # /etc/shadow's root entry via `passwd root` in xchroot.
     password*:       string
     luksPassphrase*: string
     disk*:           string
@@ -79,7 +83,6 @@ proc parseSeed*(path: string): FormData =
     of "keyboard":        result.keyboard       = value
     of "timezone":        result.timezone       = value
     of "hostname":        result.hostname       = value
-    of "user":            result.user           = value
     of "password":        result.password       = value
     of "luks_passphrase": result.luksPassphrase = value
     of "disk":            result.disk           = value
@@ -136,7 +139,6 @@ proc seedKvs*(s: FormData): seq[(string, string, bool)] =
     ("keyboard",        s.keyboard,       false),
     ("timezone",        s.timezone,       false),
     ("hostname",        s.hostname,       false),
-    ("user",            s.user,           false),
     ("password",        s.password,       true),
     ("luks_passphrase", s.luksPassphrase, true),
     ("disk",            s.disk,           false),
