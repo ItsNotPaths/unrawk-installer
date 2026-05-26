@@ -18,7 +18,7 @@
 ##                                     refuses otherwise
 
 import std/[os, options, osproc, strutils]
-import rawk_luigi, theme, preflight, runmode, logger, install, widgets, pickers
+import rawk_luigi, theme, preflight, runmode, logger, install, widgets, pickers, network
 
 # rawk_luigi doesn't yet expose UILabelSetContent (no consumer needed it
 # until now). Inline the FFI here; promote to rawk_luigi on next bump.
@@ -55,7 +55,7 @@ const
 # ---------- screen state ----------
 
 type Screen = enum
-  scForm, scConfirm, scExecute
+  scNetwork, scForm, scConfirm, scExecute
 
 # Globals — the wayluigi callback ABI is cdecl, so we can't close over
 # locals from main. State that callbacks need lives here.
@@ -95,6 +95,19 @@ var
   # gPickerItems to know what value the user picked.
   gPickerField:   PickerField
   gPickerItems:   seq[PickerItem]
+
+  # scNetwork state. gNetworkDevice is detected once on screen entry
+  # (empty = no wifi adapter, screen shows skip-only). gNetworkScan is
+  # the authoritative scan; the SSID picker indices map into it.
+  # gNetworkSelected is the chosen index, < 0 = no selection. The
+  # connect call resolves to gNetworkResult; UI reads .error to render
+  # red-banner feedback and .profilePath to seed the install.
+  gNetworkDevice:   string
+  gNetworkScan:     seq[Network]
+  gNetworkSelected: int = -1
+  gNetworkErr:      string
+  gNetworkPwTb:     ptr MaskedTextbox
+  gNetworkSsidBtn:  ptr Button
 
   # Execute-screen-specific state. Reset by initExecute, read/written by
   # the ticker and the per-tick UI refresh.
@@ -155,6 +168,10 @@ proc kbdPickerInvoke(cp: pointer) {.cdecl.}
 proc tzPickerInvoke(cp: pointer) {.cdecl.}
 proc diskPickerInvoke(cp: pointer) {.cdecl.}
 proc pickerItemInvoke(cp: pointer) {.cdecl.}
+proc networkSsidPickerInvoke(cp: pointer) {.cdecl.}
+proc networkConnectInvoke(cp: pointer) {.cdecl.}
+proc networkSkipInvoke(cp: pointer) {.cdecl.}
+proc networkRescanInvoke(cp: pointer) {.cdecl.}
 proc snapshotForm()
 
 # ---------- screen builders ----------
@@ -216,6 +233,80 @@ proc addFsRadio(parent: ptr Element, active: string) =
   gFsExt4Btn.invoke  = fsExt4Invoke
   gFsBtrfsBtn.invoke = fsBtrfsInvoke
   addSeparator(parent)
+
+proc formatNetworkRow(n: Network): string =
+  ## Display string for the SSID picker. Right-pad SSID so columns line
+  ## up at the same visual offset in the menu — wayluigi's menu items
+  ## render in the mono font so a fixed character pad is sufficient.
+  ## SSIDs longer than the pad get a single space separator instead.
+  const ssidPad = 22
+  let pad =
+    if n.ssid.len < ssidPad: repeat(' ', ssidPad - n.ssid.len)
+    else: " "
+  let sec = $n.security
+  let sig =
+    if n.signalDbm < 0: $n.signalDbm & " dBm"
+    else: ""
+  result = n.ssid & pad & sec
+  if sig.len > 0: result.add("  " & sig)
+
+proc currentNetworkLabel(): string =
+  if gNetworkSelected < 0 or gNetworkSelected >= gNetworkScan.len:
+    return "(choose…)"
+  formatNetworkRow(gNetworkScan[gNetworkSelected])
+
+proc currentNetworkIsOpen(): bool =
+  gNetworkSelected >= 0 and
+    gNetworkSelected < gNetworkScan.len and
+    gNetworkScan[gNetworkSelected].security == secOpen
+
+proc buildNetwork(parent: ptr Element) =
+  buildHeading(parent, "=== network (optional) ===")
+
+  if gNetworkErr.len > 0:
+    let line = "[!] " & gNetworkErr
+    discard labelCreate(parent, 0, line.cstring, line.len)
+    discard labelCreate(parent, 0, "".cstring, 0)
+
+  if gNetworkDevice.len == 0:
+    # No powered station device found by iwctl. Skip is the only sane
+    # action — show why, surface the Shell escape hatch for manual
+    # debugging (e.g. `rfkill unblock wifi`), then fall through.
+    discard labelCreate(parent, 0,
+      "No wireless adapter detected.".cstring, -1)
+    discard labelCreate(parent, 0,
+      "Use Shell for manual `iwctl` or `rfkill unblock`,".cstring, -1)
+    discard labelCreate(parent, 0,
+      "or Skip to continue without wifi.".cstring, -1)
+    addSeparator(parent)
+    let shellBtn = buttonCreate(parent, 0, "Shell", -1)
+    shellBtn.invoke = shellInvoke
+    let skipBtn = buttonCreate(parent, 0, "Skip", -1)
+    skipBtn.invoke = networkSkipInvoke
+    return
+
+  let devLine = "Adapter: " & gNetworkDevice
+  discard labelCreate(parent, 0, devLine.cstring, devLine.len)
+  addSeparator(parent)
+
+  gNetworkSsidBtn = addPickerField(parent, "Network",
+    currentNetworkLabel(), networkSsidPickerInvoke)
+
+  # Passphrase row. Always rendered so the layout doesn't jump between
+  # rebuilds; the connect path ignores its contents for open networks.
+  # An inline hint replaces the field title when an open AP is selected
+  # so the user understands why it's effectively a no-op.
+  let pwTitle =
+    if currentNetworkIsOpen(): "Passphrase (not needed — open network)"
+    else: "Passphrase"
+  gNetworkPwTb = addMaskedField(parent, pwTitle, "", 20)
+
+  let rescanBtn = buttonCreate(parent, 0, "Rescan", -1)
+  rescanBtn.invoke = networkRescanInvoke
+  let connectBtn = buttonCreate(parent, 0, "Connect & continue", -1)
+  connectBtn.invoke = networkConnectInvoke
+  let skipBtn = buttonCreate(parent, 0, "Skip", -1)
+  skipBtn.invoke = networkSkipInvoke
 
 proc buildForm(parent: ptr Element) =
   buildHeading(parent, "=== unrawk installer ===")
@@ -437,8 +528,11 @@ proc switchScreen(s: Screen) =
     gKbdBtn     = nil
     gTzBtn      = nil
     gDiskBtn    = nil
+    gNetworkPwTb    = nil
+    gNetworkSsidBtn = nil
     destroyChildren(addr gScreenPanel.e)
   case s
+  of scNetwork: buildNetwork(addr gScreenPanel.e)
   of scForm:    buildForm(addr gScreenPanel.e)
   of scConfirm: buildConfirm(addr gScreenPanel.e)
   of scExecute:
@@ -560,6 +654,28 @@ proc pickerItemInvoke(cp: pointer) {.cdecl.} =
   let idx = cast[int](cp)
   if idx < 0 or idx >= gPickerItems.len: return
   let value = gPickerItems[idx].value
+  case gPickerField
+  of pkfNetwork:
+    # The network screen's items map 1:1 to gNetworkScan indices. We
+    # do NOT route through snapshotForm — none of the scForm widgets
+    # exist while scNetwork is up, and reading their nil pointers would
+    # segfault. Refuse the pick if the entry is unsupported (8021x /
+    # unknown); the row was shown for context but cannot be acted on.
+    if idx >= gNetworkScan.len: return
+    if gNetworkScan[idx].security == sec8021x or
+       gNetworkScan[idx].security == secUnknown:
+      gNetworkErr = "(" & $gNetworkScan[idx].security &
+                    ") networks aren't supported here"
+      switchScreen(scNetwork)
+      return
+    gNetworkSelected = idx
+    gNetworkErr = ""
+    switchScreen(scNetwork)
+    return
+  of pkfNone:
+    return
+  else:
+    discard
   # Snapshot first so any in-progress typing in hostname/user/password
   # textboxes survives the form rebuild.
   snapshotForm()
@@ -567,7 +683,97 @@ proc pickerItemInvoke(cp: pointer) {.cdecl.} =
   of pkfKeyboard: gForm.keyboard = value
   of pkfTimezone: gForm.timezone = value
   of pkfDisk:     gForm.disk     = value
-  of pkfNone:     return
+  of pkfNone, pkfNetwork: return  # handled above; here only to satisfy exhaustiveness
+  switchScreen(scForm)
+
+# ---------- scNetwork helpers + invokes ----------
+
+# Stderr logger for the network preamble phase. Headless mode never
+# enters scNetwork (no UI), so we don't need this to feed the install
+# transcript — anything operationally interesting from the wifi step
+# either succeeds (and persists via the iwd profile) or surfaces on
+# the screen's error banner. Stderr keeps it discoverable from a tty
+# without polluting stdout (which the install execute screen captures).
+proc newNetworkLogger(): Logger =
+  newFileLogger(stderr, redactSecrets = true)
+
+proc initNetworkScreen() =
+  ## Detect the wireless device and do an initial scan. Called once
+  ## when scNetwork is entered for the first time, and again from
+  ## Rescan. Idempotent.
+  let l = newNetworkLogger()
+  if gNetworkDevice.len == 0:
+    gNetworkDevice = detectWirelessDevice(l)
+  gNetworkScan = scanNetworks(gNetworkDevice, l)
+  # A rescan may invalidate the previously-selected index (shorter
+  # list, reordered by signal). Drop selection if it would point
+  # past the new list; otherwise leave it so the user doesn't have
+  # to re-pick after a Rescan that just refreshed signal strengths.
+  if gNetworkSelected >= gNetworkScan.len:
+    gNetworkSelected = -1
+
+proc networkSsidPickerInvoke(cp: pointer) {.cdecl.} =
+  if gNetworkSsidBtn == nil or gNetworkScan.len == 0:
+    gNetworkErr = "no networks visible — try Rescan"
+    switchScreen(scNetwork)
+    return
+  var items: seq[PickerItem] = @[]
+  for n in gNetworkScan:
+    let disabled = n.security == sec8021x or n.security == secUnknown
+    let suffix = if disabled: "  (unsupported)" else: ""
+    items.add(PickerItem(
+      display: formatNetworkRow(n) & suffix,
+      value:   n.ssid,
+    ))
+  openPicker(gNetworkSsidBtn, pkfNetwork, items)
+
+proc networkSkipInvoke(cp: pointer) {.cdecl.} =
+  ## Skip leaves form.seededProfile empty — the chroot step's wifi-seed
+  ## branch becomes a no-op. The installed system boots without a saved
+  ## profile; the user runs `iwctl` themselves after first boot.
+  gNetworkErr = ""
+  switchScreen(scForm)
+
+proc networkRescanInvoke(cp: pointer) {.cdecl.} =
+  ## Blocking: iwctl scan + read takes ~1s. The UI doesn't repaint
+  ## during the syscall — acceptable here since the screen is otherwise
+  ## idle and the user clicked a button labelled "Rescan".
+  gNetworkErr = ""
+  initNetworkScreen()
+  switchScreen(scNetwork)
+
+proc networkConnectInvoke(cp: pointer) {.cdecl.} =
+  if gNetworkSelected < 0 or gNetworkSelected >= gNetworkScan.len:
+    gNetworkErr = "pick a network first"
+    switchScreen(scNetwork)
+    return
+  let chosen = gNetworkScan[gNetworkSelected]
+  if chosen.security == sec8021x:
+    gNetworkErr = "enterprise (8021x) — configure post-install instead"
+    switchScreen(scNetwork)
+    return
+  let pw =
+    if gNetworkPwTb != nil: gNetworkPwTb.value
+    else: ""
+  if chosen.security == secPsk and pw.len == 0:
+    gNetworkErr = "passphrase required for psk network"
+    switchScreen(scNetwork)
+    return
+
+  let l = newNetworkLogger()
+  let res = connect(gNetworkDevice, chosen.ssid, chosen.security, pw, l)
+  if not res.ok:
+    gNetworkErr = res.error
+    switchScreen(scNetwork)
+    return
+
+  # Connected. Record the on-disk profile path so isChroot can copy it
+  # into /mnt/var/lib/iwd/. If iwd wrote no profile (rare — would mean
+  # the connection didn't persist), seededProfile stays empty and we
+  # silently move on without seeding. The connection itself is live
+  # for the rest of the live ISO session either way.
+  gForm.seededProfile = res.profilePath
+  gNetworkErr = ""
   switchScreen(scForm)
 
 proc setFsChecked(active: string) =
@@ -651,9 +857,11 @@ proc runInteractive(cfg: RunConfig) =
     if bad.len > 0:
       buildErrorScreen(addr gScreenPanel.e, bad)
     else:
-      switchScreen(scForm)
+      initNetworkScreen()
+      switchScreen(scNetwork)
   else:
-    switchScreen(scForm)
+    initNetworkScreen()
+    switchScreen(scNetwork)
 
   selfFloat()
   discard messageLoop()

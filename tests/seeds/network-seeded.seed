@@ -1,0 +1,18 @@
+# Variant of basic.seed where the scNetwork preamble was used to
+# connect to a wifi network on the live ISO. seeded_profile holds the
+# path to the iwd profile file that the chroot step copies into
+# /mnt/var/lib/iwd/ so the installed system boots online.
+#
+# The path is intentionally fake — headless mode doesn't actually run
+# iwctl. The seed exercises the chroot's branch that emits the
+# mkdir + cp into the dry-run transcript.
+
+keyboard        = us
+timezone        = America/New_York
+hostname        = unrawk-test
+user            = alice
+password        = hunter2
+luks_passphrase = openthebox
+disk            = /dev/sda
+filesystem      = ext4
+seeded_profile  = /var/lib/iwd/MyHomeAP.psk

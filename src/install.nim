@@ -248,10 +248,17 @@ proc runChroot(s: InstallState, r: Runner): bool =
     return false
 
   if not r.place("/mnt/etc/hostname", s.form.hostname): return false
+  # Order matters: shallow → deep. `mount -a` processes fstab in file
+  # order; with /boot/efi listed before /boot, the EFI mount would fire
+  # while /boot is still the empty hidden dir on cryptroot's fs, and
+  # "/boot/efi: mount point does not exist" because the dir we created
+  # at install time lives on p2, not on cryptroot. Putting / first,
+  # then /boot, then /boot/efi makes each parent mount before its
+  # children regardless of any depth-sort the mount tool may apply.
   if not r.place("/mnt/etc/fstab",
-    &"UUID={espUuid}   /boot/efi  vfat  defaults  0 2\n" &
+    "/dev/mapper/cryptroot  /  " & s.form.filesystem & "  defaults  0 1\n" &
     &"UUID={bootUuid}  /boot      ext4  defaults  0 2\n" &
-    "/dev/mapper/cryptroot  /  " & s.form.filesystem & "  defaults  0 1\n"): return false
+    &"UUID={espUuid}   /boot/efi  vfat  defaults  0 2\n"): return false
   if not r.place("/mnt/etc/crypttab",
     &"cryptroot  UUID={luksUuid}  none  luks\n"): return false
 
@@ -273,26 +280,69 @@ proc runChroot(s: InstallState, r: Runner): bool =
   if not r.exec(&"ln -sf /usr/share/zoneinfo/{s.form.timezone} /mnt/etc/localtime"):
     return false
 
-  # Force-include dracut's crypt module so the initramfs can unlock
-  # LUKS at boot. Without this, dracut's auto-detection sometimes
-  # leaves the module out (depends on whether dm-crypt is currently
-  # loaded in the live env's kernel when xbps-reconfigure runs inside
-  # the chroot), and the kernel boots without ever prompting for a
-  # passphrase. Symptom: fsck.ext4 errors "No such file or directory"
-  # on /dev/mapper/cryptroot because cryptroot was never opened.
-  if not r.place("/mnt/etc/dracut.conf.d/10-unrawk-crypt.conf",
-    "# unrawk: ensure crypt support is always built into initramfs.\n" &
-    "add_dracutmodules+=\" crypt \"\n"): return false
+  # Seed wifi connection from the live ISO. The scNetwork preamble (or
+  # a headless seed) sets form.seededProfile to /var/lib/iwd/<file>.{psk,
+  # open,8021x} after a successful iwctl connect. Copy it byte-for-byte
+  # into the target so the installed system's iwd reads it on first
+  # boot and connects without user action. Empty seededProfile means
+  # the preamble was skipped — no-op.
+  #
+  # `cp -a` preserves mode + ownership. iwd refuses to load profiles
+  # that aren't mode 0600 (silently — it warns to syslog and skips them).
+  # The dir itself doesn't need a specific mode; iwd creates it 0700 on
+  # first write if missing, but here we mkdir it so the cp target exists.
+  if s.form.seededProfile.len > 0:
+    if not r.exec("mkdir -p /mnt/var/lib/iwd"): return false
+    let src = quoteShell(s.form.seededProfile)
+    if not r.exec(&"cp -a {src} /mnt/var/lib/iwd/"): return false
 
-  # rd.luks.name=<UUID>=<NAME> both activates the LUKS device AND maps
-  # it to /dev/mapper/<NAME>. Using rd.luks.uuid alone would name the
-  # device /dev/mapper/luks-<UUID>, which wouldn't match the
-  # /dev/mapper/cryptroot path in /etc/fstab → fstab can't find root.
+  # Build a generic (non-hostonly) initramfs. dracut's hostonly probe
+  # reads /proc/self/mountinfo, which inside xchroot is bind-mounted
+  # from the LIVE ISO (squashfs/overlay) — so host_fs_types never
+  # contains crypto_LUKS, and 90crypt's check() returns 255 and the
+  # module is dropped even with add_dracutmodules+=" crypt ". Same path
+  # also drops the dm-crypt kmods. Net effect at boot: no passphrase
+  # prompt, /dev/mapper/cryptroot never appears, dracut spins in the
+  # initqueue waiting for root, eventually drops to emergency shell.
+  # hostonly=no kills the whole class.
+  #
+  # omit_dracutmodules btrfs: cosmetic. btrfs-progs is in unrawk-base
+  # so 90btrfs ships in the initramfs; its btrfs_finished.sh re-runs
+  # on every initqueue tick and spams "Scanning for all btrfs devices"
+  # — harmless once root mounts, but pointless on an ext4 install.
+  let omitBtrfs = if s.form.filesystem == "ext4":
+                    "omit_dracutmodules+=\" btrfs \"\n"
+                  else: ""
+  # force_add_dracutmodules (not add_) — `add_` honors each module's
+  # check() function, which 90crypt's returns false-ish in environments
+  # where /proc/self/mountinfo doesn't list crypto_LUKS (i.e. always
+  # inside xchroot — /proc is bind-mounted from the live ISO). `force_`
+  # bypasses check() entirely. This conf is for FUTURE rebuilds (kernel
+  # upgrades on the installed system); the install-time rebuild below
+  # passes --force-add on the dracut command line for the same reason.
+  if not r.place("/mnt/etc/dracut.conf.d/10-unrawk-crypt.conf",
+    "hostonly=\"no\"\n" &
+    "force_add_dracutmodules+=\" crypt \"\n" &
+    "install_items+=\" /usr/sbin/cryptsetup \"\n" &
+    omitBtrfs): return false
+
+  # Need BOTH rd.luks.uuid AND rd.luks.name on the cmdline.
+  #
+  # Void's dracut (70crypt/parse-crypt.sh) dispatches on rd.luks.uuid /
+  # rd.luks.partuuid / rd.luks.serial / rd.auto — that's what triggers
+  # the udev rule generation and the cryptroot-ask invocation. rd.luks.
+  # name=<UUID>=<NAME> alone is just a naming override consulted from
+  # WITHIN those branches; without one of those activation triggers,
+  # none of the if/elif fire, no udev rule is written, no LUKS unlock
+  # happens, and there's no passphrase prompt at boot. Exact symptom
+  # we hit: dracut times out waiting for root=UUID=<fs-uuid-inside-
+  # LUKS>, which never appears because LUKS was never activated.
+  #
   # NO GRUB_ENABLE_CRYPTODISK: /boot is on the unencrypted p2
   # partition, so grub.cfg lives in plaintext and GRUB reads it
   # directly without any cryptomount dance.
   if not r.place("/mnt/etc/default/grub",
-    &"GRUB_CMDLINE_LINUX=\"rd.luks.name={luksUuid}=cryptroot\"\n"): return false
+    &"GRUB_CMDLINE_LINUX=\"rd.luks.uuid={luksUuid} rd.luks.name={luksUuid}=cryptroot\"\n"): return false
   # No --modules needed: with /boot unencrypted, GRUB reads kernel +
   # initramfs + grub.cfg from a plain ext4 partition that the firmware
   # has handed it via UEFI block I/O services. The LUKS unlock happens
@@ -301,13 +351,42 @@ proc runChroot(s: InstallState, r: Runner): bool =
     return false
   if not r.exec("xchroot /mnt grub-mkconfig -o /boot/grub/grub.cfg"): return false
 
-  # -a reconfigures every installed package. This is the right hammer
-  # here because (a) we just wrote /etc/fstab + /etc/crypttab + grub
-  # cmdline that the kernel package's post-install hook needs to see in
-  # order to bake the right initramfs, and (b) the actual kernel pkg
-  # name is version-suffixed on Void (linux6.12 etc.) so we can't pin
-  # `-f <pkgname>` without runtime detection.
+  # xbps-reconfigure -a is the same call void-mklive's installer.sh:1270
+  # makes — it skips already-installed packages (lib/package_configure.c:
+  # 126-133 returns early unless XBPS_FLAG_FORCE_CONFIGURE is set, which
+  # -f sets and -a alone does not), but that's fine for the side effects
+  # we DO want here (e.g. base-files locale generation triggered by
+  # other reconfigured packages). It does NOT reliably rebuild the
+  # initramfs; for that we call dracut directly below.
   if not r.exec("xchroot /mnt xbps-reconfigure -a"): return false
+
+  # Explicit initramfs rebuild — pattern adapted from void-mklive/
+  # installer.sh:1387 (`chroot $TARGETDIR dracut --no-hostonly ...
+  # --force`). Three things to get right:
+  #
+  # 1. EXPLICIT KVER. `uname` is a syscall, not a file — inside xchroot
+  #    it returns the LIVE ISO's running kernel, not the kernel we just
+  #    xbps-installed into /mnt. If those versions differ even by build
+  #    suffix, dracut without an explicit kver writes /boot/initramfs-
+  #    <live-kver>.img, leaving the broken /boot/initramfs-<installed-
+  #    kver>.img (built by the kernel post-install hook before this
+  #    proc wrote the dracut.conf.d) untouched — and GRUB loads that
+  #    one. We detect the installed kver from /mnt/lib/modules and pass
+  #    it positionally so dracut hits the file GRUB will actually load.
+  # 2. --force-add, not --add. `--add` is `add_dracutmodules+=` which
+  #    still honors each module's check(). 90crypt's check() returns
+  #    false in environments where /proc/self/mountinfo lacks
+  #    crypto_LUKS — which is always true inside xchroot since /proc is
+  #    bind-mounted from the live ISO. `--force-add` bypasses check()
+  #    and guarantees 90crypt inclusion.
+  # 3. --no-hostonly. Forces hostonly=no for this invocation regardless
+  #    of conf, so all storage drivers (nvme, sata, etc.) are included.
+  if not r.exec(
+      "xchroot /mnt sh -c '" &
+      "kver=$(ls -1 /lib/modules | sort -V | tail -n1) && " &
+      "dracut --no-hostonly --force-add crypt --force " &
+      "\"/boot/initramfs-${kver}.img\" \"${kver}\"'"):
+    return false
   true
 
 proc runUnmount(s: InstallState, r: Runner): bool =

@@ -1,4 +1,4 @@
-[user_input] keyboard=us timezone=America/New_York hostname=unrawk-test user=alice password=<password> luks_passphrase=<luks_passphrase> disk=/dev/sda filesystem=ext4
+[user_input] keyboard=us timezone=America/New_York hostname=unrawk-test user=alice password=<password> luks_passphrase=<luks_passphrase> disk=/dev/sda filesystem=ext4 seeded_profile=
 [note]       start: Partition disk
 [exec]       parted -s /dev/sda mklabel gpt
 [exec]       parted -s /dev/sda mkpart ESP fat32 1MiB 513MiB

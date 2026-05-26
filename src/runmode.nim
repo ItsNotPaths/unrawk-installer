@@ -50,6 +50,11 @@ type
     luksPassphrase*: string
     disk*:           string
     filesystem*:     string
+    # Populated by scNetwork when a wifi connection succeeded on the
+    # live ISO. Empty string = preamble skipped or no connection. The
+    # isSeedNetwork install step copies the corresponding iwd profile
+    # into /mnt/var/lib/iwd/ so the installed system boots online.
+    seededProfile*:  string
 
   RunConfig* = object
     mode*:      RunMode
@@ -79,6 +84,7 @@ proc parseSeed*(path: string): FormData =
     of "luks_passphrase": result.luksPassphrase = value
     of "disk":            result.disk           = value
     of "filesystem":      result.filesystem     = value
+    of "seeded_profile":  result.seededProfile  = value
     else: discard  # forward-compatible: unknown keys ignored
 
 proc parseCli*(args: openArray[string]): RunConfig =
@@ -135,4 +141,5 @@ proc seedKvs*(s: FormData): seq[(string, string, bool)] =
     ("luks_passphrase", s.luksPassphrase, true),
     ("disk",            s.disk,           false),
     ("filesystem",      s.filesystem,     false),
+    ("seeded_profile",  s.seededProfile,  false),
   ]

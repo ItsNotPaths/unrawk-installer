@@ -13,7 +13,7 @@ import std/[osproc, strutils]
 
 type
   PickerField* = enum
-    pkfNone, pkfKeyboard, pkfTimezone, pkfDisk
+    pkfNone, pkfKeyboard, pkfTimezone, pkfDisk, pkfNetwork
 
   PickerItem* = object
     display*: string  ## menu label shown to the user
